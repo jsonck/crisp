@@ -1,0 +1,5 @@
+# auth tokens copy it from ck-pc-sites local storage in app.pop-convert.com
+
+export IS_JASON_TERMINAL="true"
+alias rs='pnpm run dev'
+alias d='chrome https://app.netlify.com/sites/ck-crisp/deploys'
