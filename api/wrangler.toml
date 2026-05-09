@@ -1,0 +1,3 @@
+name = "crisp-api"
+main = "src/index.ts"
+compatibility_date = "2025-05-09"
