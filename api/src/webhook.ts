@@ -1,6 +1,7 @@
 import { Env } from "./index";
 import { answerQuestion } from "./answer";
-import { WEBSITE_ID, getRecentMessages, postNote, type CrispMessage } from "./crisp";
+import { WEBSITE_ID, getRecentMessages, getSessionApiKey, postNote, type CrispMessage } from "./crisp";
+import { fetchSiteContext } from "./site";
 
 // If a human has spoken this recently, they're on it — a suggestion note would
 // just be noise in a conversation someone is already handling.
@@ -126,7 +127,13 @@ export async function handleCrispMessage(env: Env, body: WebhookBody) {
   // drop it — answerQuestion appends the question itself.
   if (history.length && history[history.length - 1].content === question) history.pop();
 
-  const result = await answerQuestion(env, question, history);
+  // Resolve which store this is from the api_key in the Crisp session, then look
+  // up its real plan and trial state. Absent key -> no context, and the bot
+  // answers generically rather than trusting anything the browser could forge.
+  const apiKey = await getSessionApiKey(env, sessionId);
+  const siteContext = await fetchSiteContext(env, apiKey);
+
+  const result = await answerQuestion(env, question, history, siteContext);
 
   let posted = false;
   if (result.covered && result.messages.length) {
@@ -150,5 +157,6 @@ export async function handleCrispMessage(env: Env, body: WebhookBody) {
     topics_used: result.topics_used ?? [],
     posted_note: posted,
     usage: result.usage ?? null,
+    site_resolved: Boolean(siteContext),
   });
 }

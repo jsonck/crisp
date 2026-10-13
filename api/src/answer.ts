@@ -6,6 +6,7 @@ import {
   SYSTEM_INSTRUCTIONS,
   OUTPUT_FORMAT,
 } from "./kb";
+import { renderSiteContext, type SiteContext } from "./site";
 
 export interface Answer {
   covered: boolean;
@@ -28,7 +29,8 @@ const NOT_COVERED: Answer = {
 export async function answerQuestion(
   env: Env,
   question: string,
-  history: { role: "user" | "assistant"; content: string }[] = []
+  history: { role: "user" | "assistant"; content: string }[] = [],
+  siteContext: SiteContext | null = null
 ): Promise<Answer> {
   const kb = await loadKnowledgeBase(env);
   if (!kb) return NOT_COVERED;
@@ -42,6 +44,8 @@ export async function answerQuestion(
       reason: explainEmpty(kb.allTopics, kb.allQaPairs),
     };
   }
+
+  const contextBlock = siteContext ? renderSiteContext(siteContext) : "";
 
   const response = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -62,6 +66,12 @@ export async function answerQuestion(
           text: `${SYSTEM_INSTRUCTIONS}\n\n# Knowledge base\n\n${rendered}\n\n${OUTPUT_FORMAT}`,
           cache_control: { type: "ephemeral", ttl: "1h" },
         },
+        // Per-merchant facts go AFTER the cache breakpoint. They change every
+        // conversation, so caching them would invalidate the knowledge base
+        // prefix on every single message.
+        ...(contextBlock
+          ? [{ type: "text" as const, text: `# This merchant\n\n${contextBlock}` }]
+          : []),
       ],
       messages: [...history, { role: "user", content: question }],
     }),

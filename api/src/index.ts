@@ -4,6 +4,7 @@ import { dailySummary } from "./crons/daily-summary";
 import { answerQuestion } from "./answer";
 import { handleCrispMessage } from "./webhook";
 import { verifySignature } from "./crisp";
+import { fetchSiteContext } from "./site";
 
 export interface Env {
   CRISP_KEY: string;
@@ -12,6 +13,8 @@ export interface Env {
   SUPABASE_URL: string;
   SUPABASE_SECRET_KEY: string;
   CRISP_WEBHOOK_SECRET: string;
+  PC_BASE_URL: string;
+  BOT_API_SECRET: string;
 }
 
 const app = new Hono<{ Bindings: Env }>();
@@ -60,7 +63,10 @@ app.post("/answer", async (c) => {
   const question = typeof body?.question === "string" ? body.question.trim() : "";
   if (!question) return c.json({ error: "A question is required" }, 400);
 
-  const result = await answerQuestion(c.env, question, body?.history ?? []);
+  // Optional api_key lets the editor preview what a specific merchant would be
+  // told, with their plan and trial state filled in.
+  const siteContext = await fetchSiteContext(c.env, body?.api_key ?? null);
+  const result = await answerQuestion(c.env, question, body?.history ?? [], siteContext);
   return c.json(result);
 });
 

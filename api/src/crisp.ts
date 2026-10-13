@@ -57,6 +57,25 @@ export async function verifySignature(
   return diff === 0;
 }
 
+// The admin app pushes the site's api_key into Crisp session data. It is an
+// unguessable uuid that only the authenticated Shopify admin ever receives, so
+// it is the one field here worth trusting to say which store this is.
+export async function getSessionApiKey(env: Env, sessionId: string) {
+  const response = await fetch(
+    `https://api.crisp.chat/v1/website/${WEBSITE_ID}/conversation/${sessionId}`,
+    { headers: authHeaders(env) }
+  );
+
+  if (!response.ok) {
+    console.error("Crisp conversation fetch failed:", response.status);
+    return null;
+  }
+
+  const json = (await response.json()) as { data?: { meta?: { data?: Record<string, unknown> } } };
+  const key = json.data?.meta?.data?.api_key;
+  return typeof key === "string" && key ? key : null;
+}
+
 export async function getRecentMessages(env: Env, sessionId: string) {
   const response = await fetch(
     `https://api.crisp.chat/v1/website/${WEBSITE_ID}/conversation/${sessionId}/messages`,
