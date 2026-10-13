@@ -65,7 +65,7 @@ app.post("/answer", async (c) => {
   // Optional api_key lets the editor preview what a specific merchant would be
   // told, with their plan and trial state filled in.
   const siteContext = await fetchSiteContext(c.env, body?.api_key ?? null);
-  const result = await answerQuestion(c.env, question, body?.history ?? [], siteContext);
+  const result = await answerQuestion(c.env, question, body?.history ?? [], siteContext, body?.api_key ?? null);
   return c.json(result);
 });
 

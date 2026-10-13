@@ -49,14 +49,13 @@ function days(from: string | null | undefined) {
   return Number.isFinite(ms) ? Math.max(0, Math.round(ms / 86400000)) : null;
 }
 
-// Rendered for the model as plain facts. Deliberately terse: this is appended
-// after the cached prefix, so every token here is billed on every message.
+// The few facts cheap enough to put in front of the model on every message, so
+// a pricing or trial question answers in one round trip instead of two. Anything
+// deeper — campaign counts, usage, limits — is a tool the model asks for, which
+// also means a tool result carries standing that ambient context does not.
 export function renderSiteContext(ctx: SiteContext) {
   const lines: string[] = [];
-  if (ctx.site_name) lines.push(`Store: ${ctx.site_name}`);
   if (ctx.shop_plan) lines.push(`Shopify plan: ${ctx.shop_plan}`);
-  if (ctx.plan) lines.push(`Pop Convert plan: ${ctx.plan}`);
-  if (ctx.currency) lines.push(`Currency: ${ctx.currency}`);
 
   const left = days(ctx.free_until);
   if (left !== null) {
@@ -66,14 +65,10 @@ export function renderSiteContext(ctx: SiteContext) {
   if (typeof ctx.watermark_removed === "boolean") {
     lines.push(
       ctx.watermark_removed
-        ? "Branding/watermark: already removed on this account"
-        : "Branding/watermark: still showing on this account"
+        ? "Branding/watermark: already removed"
+        : "Branding/watermark: still showing"
     );
   }
-  if (typeof ctx.active_campaigns === "number") {
-    lines.push(`Campaigns: ${ctx.active_campaigns} active of ${ctx.total_campaigns ?? ctx.active_campaigns}`);
-  }
-  if (ctx.emails_enabled === false) lines.push("Email features: not enabled on this account");
 
   return lines.join("\n");
 }

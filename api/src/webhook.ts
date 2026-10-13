@@ -133,20 +133,42 @@ export async function handleCrispMessage(env: Env, body: WebhookBody) {
   const apiKey = await getSessionApiKey(env, sessionId);
   const siteContext = await fetchSiteContext(env, apiKey);
 
-  const result = await answerQuestion(env, question, history, siteContext);
+  const result = await answerQuestion(env, question, history, siteContext, apiKey);
+
+  // An action the bot already performed must never read as a suggestion. In note
+  // mode the customer is told nothing, so the agent has to send the reply - and
+  // if the note looks like a draft they will contradict work that is already done.
+  const actionLines = (result.actions_taken ?? []).map((name) =>
+    name === "remove_watermark"
+      ? "• Powered by Pop Convert branding has been REMOVED from this account"
+      : `• ${name} was executed`
+  );
 
   let posted = false;
   if (result.covered && result.messages.length) {
     const topics = result.topics_used?.length ? result.topics_used.join(", ") : "none";
-    // One note, not one per message: three separate notes would clutter the
-    // inbox. The numbering shows the team how it would arrive in the chat.
     const draft = result.messages
       .map((m, i) => (result.messages.length > 1 ? `${i + 1}. ${m}` : m))
       .join("\n");
+
+    const header = actionLines.length
+      ? `⚠️ ALREADY DONE — do not redo, and the customer has NOT been told yet\n${actionLines.join("\n")}\n\n🤖 Reply to send`
+      : "🤖 Suggested reply (not sent to the customer)";
+
     posted = await postNote(
       env,
       sessionId,
-      `🤖 Suggested reply (not sent to the customer)\n\n${draft}\n\n— from knowledge base: ${topics}`
+      `${header}\n\n${draft}\n\n— knowledge base: ${topics}${
+        result.tools_used?.length ? ` · looked up: ${[...new Set(result.tools_used)].join(", ")}` : ""
+      }`
+    );
+  } else if (actionLines.length) {
+    // The action happened but there is nothing sayable. Still tell the team,
+    // or a change to a merchant's account goes unrecorded in the conversation.
+    posted = await postNote(
+      env,
+      sessionId,
+      `⚠️ ALREADY DONE — the customer has NOT been told yet\n${actionLines.join("\n")}\n\nNo reply drafted: ${result.reason ?? "not covered by the knowledge base"}`
     );
   }
 
@@ -158,5 +180,7 @@ export async function handleCrispMessage(env: Env, body: WebhookBody) {
     posted_note: posted,
     usage: result.usage ?? null,
     site_resolved: Boolean(siteContext),
+    tools_used: result.tools_used ?? [],
+    actions_taken: result.actions_taken ?? [],
   });
 }
