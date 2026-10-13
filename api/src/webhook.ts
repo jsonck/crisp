@@ -129,18 +129,23 @@ export async function handleCrispMessage(env: Env, body: WebhookBody) {
   const result = await answerQuestion(env, question, history);
 
   let posted = false;
-  if (result.covered && result.answer.trim()) {
+  if (result.covered && result.messages.length) {
     const topics = result.topics_used?.length ? result.topics_used.join(", ") : "none";
+    // One note, not one per message: three separate notes would clutter the
+    // inbox. The numbering shows the team how it would arrive in the chat.
+    const draft = result.messages
+      .map((m, i) => (result.messages.length > 1 ? `${i + 1}. ${m}` : m))
+      .join("\n");
     posted = await postNote(
       env,
       sessionId,
-      `🤖 Suggested reply (not sent to the customer)\n\n${result.answer}\n\n— from knowledge base: ${topics}`
+      `🤖 Suggested reply (not sent to the customer)\n\n${draft}\n\n— from knowledge base: ${topics}`
     );
   }
 
   await finish({
     covered: result.covered,
-    answer: result.answer || null,
+    answer: result.messages.join("\n") || null,
     reason: result.reason || null,
     topics_used: result.topics_used ?? [],
     posted_note: posted,

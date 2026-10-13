@@ -9,7 +9,9 @@ import {
 
 export interface Answer {
   covered: boolean;
-  answer: string;
+  // One chat message per entry, the way a person types in a live chat rather
+  // than one considered paragraph. Usually length 1.
+  messages: string[];
   topics_used: string[];
   reason?: string;
   // Diagnostics, so the editor can show whether caching is actually working.
@@ -18,7 +20,7 @@ export interface Answer {
 
 const NOT_COVERED: Answer = {
   covered: false,
-  answer: "",
+  messages: [],
   topics_used: [],
   reason: "The knowledge base could not be loaded.",
 };
@@ -35,7 +37,7 @@ export async function answerQuestion(
   if (!rendered) {
     return {
       covered: false,
-      answer: "",
+      messages: [],
       topics_used: [],
       reason: explainEmpty(kb.allTopics, kb.allQaPairs),
     };
@@ -95,12 +97,29 @@ export async function answerQuestion(
 
   try {
     const parsed = JSON.parse(text) as Answer;
-    // A malformed "covered: true" with no answer would post an empty reply to
-    // a customer, so treat it as not covered.
-    if (parsed.covered && !parsed.answer?.trim()) {
-      return { covered: false, answer: "", topics_used: [], reason: "Empty answer.", usage };
+
+    // Tolerate the model returning a bare string instead of an array.
+    const raw = Array.isArray(parsed.messages)
+      ? parsed.messages
+      : typeof (parsed as any).messages === "string"
+        ? [(parsed as any).messages]
+        : typeof (parsed as any).answer === "string"
+          ? [(parsed as any).answer]
+          : [];
+
+    // Drop blanks, and cap at 3 so a runaway response can't turn into a
+    // barrage of chat messages at the customer.
+    const messages = raw
+      .filter((m): m is string => typeof m === "string" && m.trim().length > 0)
+      .map((m) => m.trim())
+      .slice(0, 3);
+
+    // A malformed "covered: true" with nothing to say would post an empty
+    // reply, so treat it as not covered.
+    if (parsed.covered && !messages.length) {
+      return { covered: false, messages: [], topics_used: [], reason: "Empty answer.", usage };
     }
-    return { ...parsed, usage };
+    return { ...parsed, messages, usage };
   } catch {
     console.error("Unparseable answer. stop_reason:", json.stop_reason, "text:", text.slice(0, 300));
     return { ...NOT_COVERED, reason: "The answering service returned an unreadable response.", usage };

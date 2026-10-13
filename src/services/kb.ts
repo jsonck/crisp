@@ -170,7 +170,7 @@ const WORKER_URL = (import.meta.env.VITE_WORKER_URL as string) ?? "";
 
 export interface BotAnswer {
   covered: boolean;
-  answer: string;
+  messages: string[];
   topics_used: string[];
   reason?: string;
   usage?: { cached: number; written: number; input: number; output: number };

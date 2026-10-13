@@ -296,8 +296,13 @@ onMounted(load);
 
           <div v-else-if="testResult" class="test-result">
             <div v-if="testResult.covered" class="answer covered">
-              <div class="answer-label">The bot would reply</div>
-              <p class="answer-text">{{ testResult.answer }}</p>
+              <div class="answer-label">
+                The bot would reply
+                <span v-if="testResult.messages.length > 1" class="bubble-count">
+                  as {{ testResult.messages.length }} messages
+                </span>
+              </div>
+              <p v-for="(m, i) in testResult.messages" :key="i" class="bubble">{{ m }}</p>
               <p v-if="testResult.topics_used?.length" class="answer-meta">
                 Drew on: {{ testResult.topics_used.join(", ") }}
               </p>
@@ -746,6 +751,26 @@ hr {
   font-size: 14px;
   margin-top: 4px;
   white-space: pre-wrap;
+}
+
+/* Rendered as chat bubbles so the split reads the way the customer sees it. */
+.bubble {
+  font-size: 14px;
+  margin-top: 6px;
+  padding: 8px 12px;
+  background: #e3f2fd;
+  border-radius: 12px 12px 12px 3px;
+  max-width: 85%;
+  white-space: pre-wrap;
+  width: fit-content;
+}
+
+.bubble-count {
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+  color: #bbb;
+  margin-left: 6px;
 }
 
 .answer-meta {
