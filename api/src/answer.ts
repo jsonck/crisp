@@ -1,5 +1,11 @@
 import { Env } from "./index";
-import { loadKnowledgeBase, renderKnowledgeBase, explainEmpty, SYSTEM_INSTRUCTIONS } from "./kb";
+import {
+  loadKnowledgeBase,
+  renderKnowledgeBase,
+  explainEmpty,
+  SYSTEM_INSTRUCTIONS,
+  OUTPUT_FORMAT,
+} from "./kb";
 
 export interface Answer {
   covered: boolean;
@@ -51,7 +57,7 @@ export async function answerQuestion(
       system: [
         {
           type: "text",
-          text: `${SYSTEM_INSTRUCTIONS}\n\n# Knowledge base\n\n${rendered}`,
+          text: `${SYSTEM_INSTRUCTIONS}\n\n# Knowledge base\n\n${rendered}\n\n${OUTPUT_FORMAT}`,
           cache_control: { type: "ephemeral", ttl: "1h" },
         },
       ],
