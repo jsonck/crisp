@@ -72,7 +72,10 @@ onMounted(fetchConversations);
 <template>
   <div class="container">
     <div class="sidebar">
-      <h2>Conversations</h2>
+      <h2>
+        Conversations
+        <router-link to="/kb" class="nav-link">Knowledge Base</router-link>
+      </h2>
       <div v-if="loading" class="loading">Loading...</div>
       <ul v-else>
         <li
@@ -206,6 +209,16 @@ onMounted(fetchConversations);
   padding: 16px;
   margin: 0;
   border-bottom: 1px solid #e0e0e0;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.nav-link {
+  font-size: 12px;
+  font-weight: 400;
+  color: #3f51b5;
+  text-decoration: none;
 }
 
 .sidebar ul {
