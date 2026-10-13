@@ -22,15 +22,14 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export async function fetchSiteContext(env: Env, apiKey: string | null) {
   if (!apiKey || !UUID.test(apiKey)) return null;
-  if (!env.PC_BASE_URL || !env.BOT_API_SECRET) {
-    console.error("Site context not configured (PC_BASE_URL / BOT_API_SECRET)");
+  if (!env.PC_BASE_URL) {
+    console.error("Site context not configured (PC_BASE_URL)");
     return null;
   }
 
   try {
     const response = await fetch(
-      `${env.PC_BASE_URL}/bot/site_context?api_key=${encodeURIComponent(apiKey)}`,
-      { headers: { Authorization: `Bearer ${env.BOT_API_SECRET}` } }
+      `${env.PC_BASE_URL}/bot/site_context?api_key=${encodeURIComponent(apiKey)}`
     );
 
     if (!response.ok) {

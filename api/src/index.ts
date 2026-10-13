@@ -14,7 +14,6 @@ export interface Env {
   SUPABASE_SECRET_KEY: string;
   CRISP_WEBHOOK_SECRET: string;
   PC_BASE_URL: string;
-  BOT_API_SECRET: string;
 }
 
 const app = new Hono<{ Bindings: Env }>();
