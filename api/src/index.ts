@@ -4,6 +4,9 @@ import { dailySummary } from "./crons/daily-summary";
 import { answerQuestion } from "./answer";
 import { handleCrispMessage } from "./webhook";
 import { verifySignature } from "./crisp";
+import { planHandoff } from "./handoff";
+import { isAnyoneOnline } from "./crisp";
+import { EMPTY_FLOW, type FlowState } from "./flow";
 import { fetchSiteContext } from "./site";
 
 export interface Env {
@@ -20,7 +23,7 @@ const app = new Hono<{ Bindings: Env }>();
 
 app.use("*", cors());
 
-// Answering burns Anthropic tokens, and this worker is on a public URL, so the
+// Answering burns Anthropic tokens, and this service is on a public URL, so the
 // caller has to prove they're an allowlisted KB editor. Rather than verifying
 // the JWT here, we hand the caller's own token back to Supabase and let
 // is_kb_editor() decide — the check can never drift from the allowlist.
@@ -45,6 +48,11 @@ app.get("/", (c) => {
   return c.json({ message: "Hello from Crisp API!" });
 });
 
+// Render pings this to decide whether the instance is healthy. Deliberately
+// does no I/O: a health check that talks to Supabase turns someone else's
+// outage into our instance being replaced.
+app.get("/health", (c) => c.json({ ok: true, uptime: process.uptime() }));
+
 // Manual trigger for testing
 app.get("/test-summary", async (c) => {
   await dailySummary(c.env);
@@ -63,10 +71,51 @@ app.post("/answer", async (c) => {
   if (!question) return c.json({ error: "A question is required" }, 400);
 
   // Optional api_key lets the editor preview what a specific merchant would be
-  // told, with their plan and trial state filled in.
-  const siteContext = await fetchSiteContext(c.env, body?.api_key ?? null);
-  const result = await answerQuestion(c.env, question, body?.history ?? [], siteContext, body?.api_key ?? null);
-  return c.json(result);
+  // told, with their plan and trial state filled in. Tools run for real against
+  // that account — `actions_taken` in the response says whether one changed
+  // anything, and the editor surfaces it.
+  const apiKey = body?.api_key ?? null;
+  const siteContext = await fetchSiteContext(c.env, apiKey);
+
+  // History arrives oldest-first, same shape the webhook builds from Crisp.
+  const history = Array.isArray(body?.history)
+    ? body.history
+        .filter(
+          (m: any) =>
+            (m?.role === "user" || m?.role === "assistant") &&
+            typeof m?.content === "string" &&
+            m.content.trim()
+        )
+        .slice(-10)
+        .map((m: any) => ({ role: m.role, content: m.content }))
+    : [];
+
+  // The tester has no Crisp session, so flow state is supplied by the caller —
+  // the editor tracks it from the step markers in each previous reply. Same
+  // shape the webhook loads from the database, so the script behaves the same.
+  const flow: FlowState = {
+    ...EMPTY_FLOW,
+    ...(body?.flow && typeof body.flow === "object" ? body.flow : {}),
+    storeUrl: body?.flow?.storeUrl ?? body?.store_url ?? null,
+  };
+
+  const result = await answerQuestion(c.env, question, history, siteContext, apiKey, flow);
+
+  // When the bot gives up, show what the handoff WOULD do. planHandoff reads
+  // live routing and availability but writes nothing to Crisp, so reviewing the
+  // wording here costs no real conversation. There is no session to inspect, so
+  // it plans as though the conversation were unassigned.
+  const handoff =
+    !result.covered && result.needs_human !== false
+      ? await planHandoff(c.env, null)
+      : null;
+
+  // Whether this answer would actually reach a customer depends on live staffing
+  // as well as topic autonomy, so the editor is told both rather than only the
+  // half it can work out from topics_used.
+  const nobody_online = (await isAnyoneOnline(c.env)) === false;
+
+  return c.json({ ...result, handoff, nobody_online });
 });
 
 // Crisp wants a response in under a second, and answering takes several. So
@@ -101,9 +150,7 @@ app.post("/crisp/webhook", async (c) => {
   return c.json({ received: true });
 });
 
-export default {
-  fetch: app.fetch,
-  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
-    ctx.waitUntil(dailySummary(env));
-  },
-};
+// The server (src/server.ts) supplies the env and execution context and owns
+// the schedule; this module stays a plain Hono app so it can be mounted by any
+// runtime, and so tests can call app.fetch directly.
+export default app;

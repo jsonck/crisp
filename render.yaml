@@ -1,0 +1,34 @@
+# Render deployment for the Crisp support bot API.
+#
+# Why a web service and not a cron job plus a function: the Crisp webhook has
+# to be acknowledged in under a second, and the daily summary is scheduled
+# in-process (see src/server.ts). An instance that sleeps would drop webhooks
+# on wake, so this must stay on an always-on plan — Starter or above, never
+# Free.
+services:
+  - type: web
+    name: crisp-api
+    runtime: node
+    plan: starter
+    rootDir: api
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      # Values are set in the Render dashboard, not here. `sync: false` means
+      # Render will not overwrite them from this file.
+      - key: CRISP_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SECRET_KEY
+        sync: false
+      - key: CRISP_WEBHOOK_SECRET
+        sync: false
+      - key: PC_BASE_URL
+        sync: false
+      - key: MAILGUN_KEY
+        sync: false

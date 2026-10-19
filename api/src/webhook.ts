@@ -1,6 +1,16 @@
 import { Env } from "./index";
 import { answerQuestion } from "./answer";
-import { WEBSITE_ID, getRecentMessages, getSessionApiKey, postNote, type CrispMessage } from "./crisp";
+import {
+  WEBSITE_ID,
+  getRecentMessages,
+  getSessionContext,
+  postNote,
+  sendMessage,
+  isAnyoneOnline,
+  type CrispMessage,
+} from "./crisp";
+import { loadFlow, recordFlow } from "./flow";
+import { performHandoff, HANDOFF_QUIET_WINDOW_MS } from "./handoff";
 import { fetchSiteContext } from "./site";
 
 // If a human has spoken this recently, they're on it — a suggestion note would
@@ -9,6 +19,22 @@ const OPERATOR_ACTIVE_WINDOW_MS = 15 * 60 * 1000;
 
 // How much of the conversation the model sees for context.
 const HISTORY_LIMIT = 10;
+
+// A split reply is several chat messages. Sending them in the same instant
+// reads as a wall of text, so they go out a beat apart. This is the only delay
+// in the flow — long enough to read naturally, not long enough to pretend
+// somebody is doing manual work.
+const MESSAGE_GAP_MS = 1200;
+
+// When nobody is on shift, a suggested note has nobody to suggest it to: it
+// sits there until someone logs in, which the transcripts show can be hours
+// (one watermark request at 10:28 was answered at 16:07). An answer the bot is
+// confident in is worth more to the customer than a note nobody will read, so
+// out of hours a covered answer is sent regardless of its topic's autonomy.
+//
+// Set REPLY_WHEN_UNSTAFFED=false to switch this off without a code change —
+// it is the kill switch for everything this constant enables.
+const REPLY_WHEN_UNSTAFFED = process.env.REPLY_WHEN_UNSTAFFED !== "false";
 
 interface WebhookBody {
   event?: string;
@@ -130,10 +156,16 @@ export async function handleCrispMessage(env: Env, body: WebhookBody) {
   // Resolve which store this is from the api_key in the Crisp session, then look
   // up its real plan and trial state. Absent key -> no context, and the bot
   // answers generically rather than trusting anything the browser could forge.
-  const apiKey = await getSessionApiKey(env, sessionId);
+  const session = await getSessionContext(env, sessionId);
+  const apiKey = session.apiKey;
   const siteContext = await fetchSiteContext(env, apiKey);
 
-  const result = await answerQuestion(env, question, history, siteContext, apiKey);
+  // Where the branding-removal script has got to in this conversation, plus
+  // Pop Convert's own review gate.
+  const flow = await loadFlow(env, sessionId, session.qualification);
+  if (session.storeUrl && !flow.storeUrl) flow.storeUrl = session.storeUrl;
+
+  const result = await answerQuestion(env, question, history, siteContext, apiKey, flow);
 
   // An action the bot already performed must never read as a suggestion. In note
   // mode the customer is told nothing, so the agent has to send the reply - and
@@ -145,7 +177,59 @@ export async function handleCrispMessage(env: Env, body: WebhookBody) {
   );
 
   let posted = false;
-  if (result.covered && result.messages.length) {
+  let sent = false;
+  let handoff: { to: string | null; sent: boolean; wasAssigned: boolean } = {
+    to: null,
+    sent: false,
+    wasAssigned: false,
+  };
+
+  // Not covered, and a real person is waiting: bring in a human and say so.
+  // This is the branch that used to do nothing at all.
+  if (!result.covered && result.needs_human !== false) {
+    const announce = !(await alreadyHandedOff(env, sessionId));
+    handoff = await performHandoff(env, sessionId, result.reason ?? null, announce);
+  }
+
+  // Two independent reasons to speak to the customer rather than draft a note:
+  // the topic has been promoted to autonomous, or there is nobody on shift to
+  // send the draft. Unknown availability counts as staffed, so a Crisp outage
+  // makes the bot quieter rather than chattier.
+  const nobodyOnline =
+    REPLY_WHEN_UNSTAFFED && result.covered && result.messages.length
+      ? (await isAnyoneOnline(env)) === false
+      : false;
+
+  const sendReason = result.sendable
+    ? "autonomous_topic"
+    : nobodyOnline
+      ? "nobody_online"
+      : null;
+
+  if (result.covered && result.messages.length && sendReason) {
+    for (const [i, message] of result.messages.entries()) {
+      if (i > 0) await new Promise((r) => setTimeout(r, MESSAGE_GAP_MS));
+      const ok = await sendMessage(env, sessionId, message);
+      sent = sent || ok;
+    }
+
+    // The team still gets a record, because an answer that went out unseen is
+    // the thing they will most want to audit.
+    posted = await postNote(
+      env,
+      sessionId,
+      [
+        sendReason === "autonomous_topic"
+          ? "🤖 SENT TO THE CUSTOMER (autonomous topic)"
+          : "🤖 SENT TO THE CUSTOMER (nobody was online to send it)",
+        ...actionLines,
+        "",
+        ...result.messages,
+        "",
+        `— knowledge base: ${result.topics_used?.join(", ") || "none"}`,
+      ].join("\n")
+    );
+  } else if (result.covered && result.messages.length) {
     const topics = result.topics_used?.length ? result.topics_used.join(", ") : "none";
     const draft = result.messages
       .map((m, i) => (result.messages.length > 1 ? `${i + 1}. ${m}` : m))
@@ -172,15 +256,54 @@ export async function handleCrispMessage(env: Env, body: WebhookBody) {
     );
   }
 
+  // Record what this turn actually did, so the next one does not repeat it.
+  // Both step markers come from the model's own response rather than from
+  // pattern-matching its words, which would eventually mislabel a turn and
+  // either repeat a question or skip one.
+  // The removal is a real account change and is recorded either way. The two
+  // conversational steps only count if the customer actually SAW them — a reply
+  // that stayed a private note asked them nothing, and recording it would make
+  // the next turn skip a step the merchant never received.
+  const removedNow = (result.actions_taken ?? []).includes("remove_watermark");
+  const askedConfirmNow = sent && result.asked_to_confirm === true;
+  const askedReviewNow = sent && result.asked_for_review === true;
+
+  if (removedNow || askedConfirmNow || askedReviewNow) {
+    await recordFlow(env, sessionId, websiteId, {
+      storeUrl: flow.storeUrl,
+      askedConfirm: askedConfirmNow,
+      removed: removedNow,
+      reviewAsked: askedReviewNow,
+    });
+  }
+
   await finish({
     covered: result.covered,
     answer: result.messages.join("\n") || null,
     reason: result.reason || null,
     topics_used: result.topics_used ?? [],
     posted_note: posted,
+    reply_sent: sent,
+    send_reason: sent ? sendReason : null,
     usage: result.usage ?? null,
     site_resolved: Boolean(siteContext),
     tools_used: result.tools_used ?? [],
     actions_taken: result.actions_taken ?? [],
+    needs_human: result.needs_human ?? null,
+    handoff_to: handoff.to,
+    handoff_sent: handoff.sent,
+    was_assigned: handoff.wasAssigned,
   });
+}
+
+// Did we already promise this conversation a human recently? Checks our own
+// record rather than the Crisp transcript: it is one indexed query, and it is
+// the same source of truth the rest of this function writes to.
+async function alreadyHandedOff(env: Env, sessionId: string) {
+  const since = new Date(Date.now() - HANDOFF_QUIET_WINDOW_MS).toISOString();
+  const rows = await supabase(
+    env,
+    `/bot_suggestions?session_id=eq.${sessionId}&handoff_sent=is.true&created_at=gt.${since}&select=id&limit=1`
+  );
+  return Array.isArray(rows) && rows.length > 0;
 }

@@ -15,6 +15,8 @@ import {
   type Topic,
   type QaPair,
   type BotAnswer,
+  type ChatTurn,
+  type FlowState,
 } from "../services/kb";
 
 const loading = ref(true);
@@ -112,7 +114,20 @@ async function saveTopic() {
 
 async function toggleTopic(topic: Topic) {
   busy.value[topic.id] = true;
-  await updateTopic(topic.id, { enabled: !topic.enabled });
+  // Switching a topic off also revokes its licence to talk to customers.
+  // Leaving autonomous set on a dormant topic is a trap waiting for whoever
+  // turns it back on months from now.
+  await updateTopic(topic.id, {
+    enabled: !topic.enabled,
+    ...(topic.enabled ? { autonomous: false } : {}),
+  });
+  busy.value[topic.id] = false;
+  await load();
+}
+
+async function toggleAutonomous(topic: Topic) {
+  busy.value[topic.id] = true;
+  await updateTopic(topic.id, { autonomous: !topic.autonomous });
   busy.value[topic.id] = false;
   await load();
 }
@@ -198,24 +213,117 @@ async function removeQa(qa: QaPair) {
 }
 
 // --- test the bot ---------------------------------------------------------
+//
+// A running conversation rather than one question at a time: the bot's own
+// previous replies go back as history, which is the only way to exercise the
+// tool loop, a follow-up question, or whether it keeps conceding once it has
+// said it doesn't know.
+
+interface ChatEntry {
+  role: "user" | "assistant";
+  content: string;
+  // Assistant entries carry the full result so the transcript can show what
+  // the reply was built from, turn by turn.
+  result?: BotAnswer;
+}
 
 const testOpen = ref(false);
 const testQ = ref("");
 const testing = ref(false);
-const testResult = ref<BotAnswer | null>(null);
 const testError = ref<string | null>(null);
+const chat = ref<ChatEntry[]>([]);
+
+// Prefilled from the local env so the common case — testing against a known
+// store — needs no copy-paste. Gated on DEV because VITE_* values are inlined
+// at build time, and this bundle is served publicly: an api_key in it would
+// hand remove_watermark on a real merchant's account to anyone reading source.
+// Does the tester pretend this merchant may be asked for a review? Production
+// reads Pop Convert's own gate (Qualifier.qualify === "mango"); here it is a
+// checkbox so both branches of the script can be rehearsed.
+const testReviewAllowed = ref(true);
+const testStoreUrl = ref("carmenjewel.myshopify.com");
+
+const testApiKey = ref(
+  import.meta.env.DEV ? ((import.meta.env.VITE_TEST_API_KEY as string) ?? "") : ""
+);
+
+// Only the words go back to the model — the same shape the Crisp webhook
+// builds, so the prompt under test is the prompt that ships.
+const history = computed<ChatTurn[]>(() =>
+  chat.value.map((e) => ({ role: e.role, content: e.content }))
+);
+
+// Everything the bot changed on a real account during this conversation. Tools
+// are live, so this is a record of real consequences, not a preview.
+const chatActions = computed(() =>
+  chat.value.flatMap((e) => e.result?.actions_taken ?? [])
+);
+
+// Totals across the conversation. Worth watching here specifically: the whole
+// point of the 1h cache breakpoint is that turn two onward reads the knowledge
+// base from cache instead of paying for it again.
+const chatUsage = computed(() =>
+  chat.value.reduce(
+    (sum, e) => ({
+      cached: sum.cached + (e.result?.usage?.cached ?? 0),
+      written: sum.written + (e.result?.usage?.written ?? 0),
+      input: sum.input + (e.result?.usage?.input ?? 0),
+      output: sum.output + (e.result?.usage?.output ?? 0),
+    }),
+    { cached: 0, written: 0, input: 0, output: 0 }
+  )
+);
+
+// Rebuilt from the step markers in replies so far, mirroring what the webhook
+// would have stored in watermark_flows.
+const flowState = computed<Partial<FlowState>>(() => ({
+  askedConfirm: chat.value.some((e) => e.result?.asked_to_confirm),
+  removed: chat.value.some((e) => e.result?.actions_taken?.includes("remove_watermark")),
+  reviewAsked: chat.value.some((e) => e.result?.asked_for_review),
+  reviewAllowed: testReviewAllowed.value,
+  storeUrl: testStoreUrl.value.trim() || null,
+}));
 
 async function runTest() {
-  if (!testQ.value.trim() || testing.value) return;
+  const question = testQ.value.trim();
+  if (!question || testing.value) return;
+
   testing.value = true;
-  testResult.value = null;
   testError.value = null;
 
-  const { answer, error } = await testQuestion(testQ.value.trim());
-  if (error) testError.value = error;
-  else testResult.value = answer ?? null;
+  const priorHistory = history.value;
+  chat.value.push({ role: "user", content: question });
+  testQ.value = "";
+
+  const priorFlow = flowState.value;
+  const { answer, error } = await testQuestion(
+    question,
+    priorHistory,
+    testApiKey.value.trim() || null,
+    priorFlow
+  );
+
+  if (error) {
+    testError.value = error;
+    // Put the question back rather than silently losing it.
+    chat.value.pop();
+    testQ.value = question;
+  } else if (answer) {
+    // A handoff has no customer-visible words of its own in `messages`, so the
+    // transcript shows the handoff line instead — what the customer would read.
+    const spoken = answer.covered
+      ? answer.messages.join("\n")
+      : answer.handoff?.message ?? "";
+    chat.value.push({ role: "assistant", content: spoken, result: answer });
+  }
 
   testing.value = false;
+}
+
+function resetChat() {
+  chat.value = [];
+  testError.value = null;
+  testQ.value = "";
 }
 
 async function leave() {
@@ -281,48 +389,132 @@ onMounted(load);
         </button>
 
         <div v-if="testOpen" class="test-body">
+          <div class="test-store">
+            <input
+              v-model="testApiKey"
+              class="store-input"
+              placeholder="Store api_key (optional) — enables account lookups"
+            />
+            <button v-if="chat.length" class="ghost small" @click="resetChat">
+              New conversation
+            </button>
+          </div>
+
+          <div class="test-store">
+            <input
+              v-model="testStoreUrl"
+              class="store-input"
+              placeholder="Store URL the bot should ask them to confirm"
+            />
+            <label class="toggle small-toggle">
+              <input type="checkbox" v-model="testReviewAllowed" />
+              <span>Review-eligible</span>
+            </label>
+          </div>
+
+          <p v-if="testApiKey.trim()" class="test-warn">
+            ⚠ Tools are live. A watermark question will really remove that store's
+            branding.
+          </p>
+
+          <div v-if="chat.length" class="transcript">
+            <div v-for="(entry, i) in chat" :key="i" class="turn" :class="entry.role">
+              <div v-if="entry.role === 'user'" class="bubble you">{{ entry.content }}</div>
+
+              <template v-else>
+                <p
+                  v-for="(m, j) in entry.result?.covered ? entry.result.messages : [entry.content]"
+                  :key="j"
+                  class="bubble bot"
+                  :class="{ handoff: !entry.result?.covered }"
+                >
+                  {{ m }}
+                </p>
+
+                <div class="turn-meta">
+                  <span v-if="entry.result?.covered && entry.result.topics_used?.length">
+                    {{ entry.result.topics_used.join(", ") }}
+                  </span>
+                  <span v-if="entry.result?.tools_used?.length" class="tools">
+                    looked up: {{ [...new Set(entry.result.tools_used)].join(", ") }}
+                  </span>
+                  <span v-if="entry.result?.actions_taken?.length" class="did">
+                    ⚠ really did: {{ entry.result.actions_taken.join(", ") }}
+                  </span>
+                  <span v-if="entry.result?.asked_to_confirm" class="step">
+                    step: asked to confirm store
+                  </span>
+                  <span v-if="entry.result?.asked_for_review" class="step">
+                    step: asked for review
+                  </span>
+                  <span v-if="entry.result?.covered" class="step">
+                    {{
+                      entry.result.sendable
+                        ? "would SEND to customer (autonomous topic)"
+                        : entry.result.nobody_online
+                          ? "would SEND to customer (nobody online)"
+                          : "would stay a note"
+                    }}
+                  </span>
+                </div>
+
+                <div v-if="entry.result && !entry.result.covered" class="handoff-box">
+                  <template v-if="entry.result.needs_human === false">
+                    <div class="handoff-label">No human needed</div>
+                    <p class="handoff-line">
+                      Treated as spam or an automated message — no reply, nobody assigned.
+                    </p>
+                  </template>
+                  <template v-else-if="entry.result.handoff">
+                    <div class="handoff-label">Would hand off (simulated)</div>
+                    <p class="handoff-line">
+                      {{
+                        entry.result.handoff.wouldAssign
+                          ? `Assign to ${entry.result.handoff.targetName}`
+                          : entry.result.handoff.targetName
+                            ? `Leave with ${entry.result.handoff.targetName}`
+                            : "Nobody eligible online"
+                      }}<span v-if="!entry.result.handoff.someoneOnline"> — away, so no instant promise</span>
+                    </p>
+                    <p class="handoff-line">
+                      Mentions: {{ entry.result.handoff.mentionNames.join(", ") || "none" }}
+                    </p>
+                  </template>
+                  <p v-if="entry.result.reason" class="handoff-why">
+                    Why it stopped: {{ entry.result.reason }}
+                  </p>
+                </div>
+              </template>
+            </div>
+          </div>
+
+          <p v-else class="test-empty">
+            Have a conversation the way a merchant would — follow-ups included.
+          </p>
+
           <form class="test-form" @submit.prevent="runTest">
             <input
               v-model="testQ"
-              placeholder="Ask something a customer would ask..."
+              :placeholder="chat.length ? 'Reply as the customer...' : 'Ask something a customer would ask...'"
               :disabled="testing"
             />
             <button type="submit" :disabled="testing || !testQ.trim()">
-              {{ testing ? "Asking..." : "Ask" }}
+              {{ testing ? "..." : "Send" }}
             </button>
           </form>
 
           <p v-if="testError" class="test-error">{{ testError }}</p>
 
-          <div v-else-if="testResult" class="test-result">
-            <div v-if="testResult.covered" class="answer covered">
-              <div class="answer-label">
-                The bot would reply
-                <span v-if="testResult.messages.length > 1" class="bubble-count">
-                  as {{ testResult.messages.length }} messages
-                </span>
-              </div>
-              <p v-for="(m, i) in testResult.messages" :key="i" class="bubble">{{ m }}</p>
-              <p v-if="testResult.topics_used?.length" class="answer-meta">
-                Drew on: {{ testResult.topics_used.join(", ") }}
-              </p>
-            </div>
+          <p v-if="chatActions.length" class="test-warn actions">
+            ⚠ This conversation really changed the account: {{ chatActions.join(", ") }}
+          </p>
 
-            <div v-else class="answer uncovered">
-              <div class="answer-label">The bot would hand this to a human</div>
-              <p class="answer-text">{{ testResult.reason || "Not covered by the knowledge base." }}</p>
-              <p class="answer-meta">
-                Add a Q&amp;A for this if the team answers it often.
-              </p>
-            </div>
-
-            <p v-if="testResult.usage" class="answer-usage">
-              {{ testResult.usage.cached }} cached &middot;
-              {{ testResult.usage.written }} written to cache &middot;
-              {{ testResult.usage.input }} new input &middot;
-              {{ testResult.usage.output }} output
-            </p>
-          </div>
+          <p v-if="chat.length" class="chat-usage">
+            {{ chatUsage.cached }} cached &middot;
+            {{ chatUsage.written }} written to cache &middot;
+            {{ chatUsage.input }} new input &middot;
+            {{ chatUsage.output }} output
+          </p>
         </div>
       </div>
 
@@ -342,6 +534,31 @@ onMounted(load);
             />
             <span>{{ selectedTopic.enabled ? "Live" : "Off" }}</span>
           </label>
+        </div>
+
+        <div class="autonomy" :class="{ on: selectedTopic.autonomous }">
+          <label class="toggle">
+            <input
+              type="checkbox"
+              :checked="selectedTopic.autonomous"
+              :disabled="busy[selectedTopic.id] || !selectedTopic.enabled"
+              @change="toggleAutonomous(selectedTopic)"
+            />
+            <span>
+              {{
+                selectedTopic.autonomous
+                  ? "Replying to customers directly"
+                  : "Suggest only — an operator sends the reply"
+              }}
+            </span>
+          </label>
+          <p class="autonomy-hint">
+            {{
+              selectedTopic.autonomous
+                ? "Answers drawn only from this topic go straight to the customer. Turn this off to stop that immediately."
+                : "Turn this on once this topic's drafts have proven right. An answer that also draws on a suggest-only topic stays a suggestion."
+            }}
+          </p>
         </div>
 
         <div v-if="strandedCount" class="stranded">
@@ -726,20 +943,128 @@ hr {
   color: #f44336;
 }
 
-.test-result {
-  margin-top: 12px;
+.small-toggle {
+  font-size: 12px;
+  white-space: nowrap;
 }
 
-.answer {
-  border-left: 3px solid #4caf50;
-  padding: 2px 0 2px 12px;
+.turn-meta .step {
+  color: #5c6bc0;
 }
 
-.answer.uncovered {
-  border-left-color: #ff9800;
+.autonomy {
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  border: 1px solid #e0e0e0;
+  border-radius: 6px;
+  background: #fafafa;
 }
 
-.answer-label {
+/* Deliberately conspicuous when live: this is the one switch that lets the bot
+   speak to a customer unsupervised. */
+.autonomy.on {
+  border-color: #a5d6a7;
+  background: #f1f8f2;
+}
+
+.autonomy-hint {
+  font-size: 12px;
+  color: #888;
+  margin-top: 5px;
+}
+
+.test-store {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.store-input {
+  flex: 1;
+  font-family: inherit;
+  font-size: 13px;
+  padding: 7px 10px;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+}
+
+button.small {
+  padding: 7px 10px;
+  font-size: 12px;
+}
+
+/* Live tools can change a real merchant's account, so this is deliberately
+   loud and sits both above the conversation and under it. */
+.test-warn {
+  font-size: 12px;
+  color: #a05a00;
+  background: #fff8e8;
+  border: 1px solid #ffd27f;
+  border-radius: 6px;
+  padding: 7px 10px;
+  margin-bottom: 10px;
+}
+
+.transcript {
+  max-height: 420px;
+  overflow-y: auto;
+  padding: 4px 2px 10px;
+  margin-bottom: 10px;
+}
+
+.turn.user {
+  display: flex;
+  justify-content: flex-end;
+}
+
+/* Rendered as chat bubbles so a split reply reads the way the customer sees it. */
+.bubble {
+  font-size: 14px;
+  margin-top: 6px;
+  padding: 8px 12px;
+  border-radius: 12px 12px 12px 3px;
+  max-width: 85%;
+  white-space: pre-wrap;
+  width: fit-content;
+}
+
+.bubble.you {
+  background: #eceff1;
+  border-radius: 12px 12px 3px 12px;
+}
+
+.bubble.bot {
+  background: #e3f2fd;
+}
+
+/* A handoff is the bot declining, not answering — coloured to match the
+   "would hand off" box rather than a normal reply. */
+.bubble.bot.handoff {
+  background: #fff3e0;
+}
+
+.turn-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  font-size: 11px;
+  color: #999;
+  margin-top: 5px;
+}
+
+.turn-meta .did {
+  color: #a05a00;
+  font-weight: 600;
+}
+
+.handoff-box {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-left: 3px solid #ff9800;
+  background: #fffdf8;
+}
+
+.handoff-label {
   font-size: 10px;
   font-weight: 600;
   text-transform: uppercase;
@@ -747,39 +1072,29 @@ hr {
   color: #888;
 }
 
-.answer-text {
-  font-size: 14px;
-  margin-top: 4px;
-  white-space: pre-wrap;
+.handoff-line {
+  font-size: 13px;
+  margin-top: 3px;
 }
 
-/* Rendered as chat bubbles so the split reads the way the customer sees it. */
-.bubble {
-  font-size: 14px;
-  margin-top: 6px;
-  padding: 8px 12px;
-  background: #e3f2fd;
-  border-radius: 12px 12px 12px 3px;
-  max-width: 85%;
-  white-space: pre-wrap;
-  width: fit-content;
-}
-
-.bubble-count {
-  font-weight: 400;
-  text-transform: none;
-  letter-spacing: 0;
-  color: #bbb;
-  margin-left: 6px;
-}
-
-.answer-meta {
+.handoff-why {
   font-size: 12px;
   color: #999;
-  margin-top: 6px;
+  margin-top: 5px;
 }
 
-.answer-usage {
+.test-empty {
+  font-size: 13px;
+  color: #999;
+  margin-bottom: 10px;
+}
+
+.test-warn.actions {
+  margin-top: 10px;
+  margin-bottom: 0;
+}
+
+.chat-usage {
   font-size: 11px;
   color: #bbb;
   margin-top: 10px;

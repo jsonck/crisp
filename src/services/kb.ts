@@ -1,4 +1,4 @@
-import { supabase } from "./supabase";
+import { supabase, devSignIn } from "./supabase";
 
 export interface Topic {
   id: string;
@@ -6,6 +6,9 @@ export interface Topic {
   slug: string | null;
   applies_when: string | null;
   enabled: boolean;
+  // When true, answers drawn solely from this topic are SENT to the customer
+  // rather than posted as a suggestion for an operator. Off by default.
+  autonomous: boolean;
   position: number;
   updated_at: string;
 }
@@ -24,6 +27,9 @@ export interface QaPair {
 // --- auth -----------------------------------------------------------------
 
 export async function getSession() {
+  // Locally this is the thing that creates the session; everywhere else it is
+  // an already-resolved promise.
+  await devSignIn;
   const { data } = await supabase.auth.getSession();
   return data.session;
 }
@@ -43,6 +49,7 @@ export async function signOut() {
 // Distinguishes "logged in but not allowlisted" from "KB is empty", which
 // otherwise look identical through RLS.
 export async function isKbEditor() {
+  await devSignIn;
   const { data, error } = await supabase.rpc("is_kb_editor");
   if (error) {
     console.error("is_kb_editor failed:", error);
@@ -166,30 +173,88 @@ export async function listAllQaPairs() {
 
 // --- bot testing ----------------------------------------------------------
 
-const WORKER_URL = (import.meta.env.VITE_WORKER_URL as string) ?? "";
+// In dev, prefer a locally running API if one is configured — otherwise "test
+// the bot" silently exercises the DEPLOYED code while you edit the local
+// prompt, which is confusing in exactly the way you would expect. Statically
+// false in a build, so production always uses the real URL.
+const API_URL =
+  (import.meta.env.DEV && (import.meta.env.VITE_API_URL_LOCAL as string)) ||
+  ((import.meta.env.VITE_WORKER_URL as string) ?? "");
+
+export interface HandoffPlan {
+  target: string | null;
+  targetName: string | null;
+  mentions: string[];
+  mentionNames: string[];
+  wasAssigned: boolean;
+  wouldAssign: boolean;
+  someoneOnline: boolean;
+  message: string;
+}
+
+export interface FlowState {
+  askedConfirm: boolean;
+  removed: boolean;
+  reviewAsked: boolean;
+  reviewAllowed: boolean;
+  storeUrl: string | null;
+}
 
 export interface BotAnswer {
   covered: boolean;
+  needs_human?: boolean;
+  sendable?: boolean;
+  asked_to_confirm?: boolean;
+  asked_for_review?: boolean;
   messages: string[];
   topics_used: string[];
   reason?: string;
+  tools_used?: string[];
+  actions_taken?: string[];
+  // Present only when the bot gave up. Simulated: nothing is written to Crisp.
+  handoff?: HandoffPlan | null;
+  // True when no operator is on shift, in which case a covered answer is sent
+  // to the customer even if its topic is still suggest-only.
+  nobody_online?: boolean;
   usage?: { cached: number; written: number; input: number; output: number };
 }
 
-// Asks the worker what the bot would say right now, using the live KB. The
-// worker re-checks editor access with this same token.
-export async function testQuestion(question: string) {
+export interface ChatTurn {
+  role: "user" | "assistant";
+  content: string;
+}
+
+// Asks the API what the bot would say right now, using the live KB. The
+// server re-checks editor access with this same token.
+//
+// `history` is the conversation so far, oldest first — the same thing the Crisp
+// webhook assembles from the real transcript, so a multi-turn test exercises
+// the prompt that actually ships rather than a cold open.
+//
+// `apiKey` makes the merchant's real account visible to the bot AND makes its
+// tools live: a watermark question will really remove that store's branding.
+export async function testQuestion(
+  question: string,
+  history: ChatTurn[] = [],
+  apiKey?: string | null,
+  flow?: Partial<FlowState>
+) {
   const session = await getSession();
   if (!session) return { error: "Your session expired — sign in again." };
 
   try {
-    const response = await fetch(`${WORKER_URL}/answer`, {
+    const response = await fetch(`${API_URL}/answer`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${session.access_token}`,
       },
-      body: JSON.stringify({ question }),
+      body: JSON.stringify({
+        question,
+        history,
+        ...(apiKey ? { api_key: apiKey } : {}),
+        ...(flow ? { flow } : {}),
+      }),
     });
 
     if (!response.ok) {
@@ -198,6 +263,12 @@ export async function testQuestion(question: string) {
     }
     return { answer: (await response.json()) as BotAnswer };
   } catch (e: any) {
-    return { error: e?.message ?? "Could not reach the answering service." };
+    return {
+      error:
+        e?.message ??
+        (import.meta.env.DEV && import.meta.env.VITE_API_URL_LOCAL
+          ? `Could not reach the local API at ${API_URL} — is it running? (cd api && npm run dev)`
+          : "Could not reach the answering service."),
+    };
   }
 }

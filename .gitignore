@@ -30,3 +30,7 @@ dist-ssr
 
 # Wrangler local state
 .wrangler
+
+# Wrangler local secrets
+.dev.vars
+api/.env

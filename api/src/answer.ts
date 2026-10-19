@@ -7,10 +7,24 @@ import {
   OUTPUT_FORMAT,
 } from "./kb";
 import { renderSiteContext, type SiteContext } from "./site";
+import { renderFlow, type FlowState } from "./flow";
 import { TOOL_DEFINITIONS, runTool, type ToolOutcome } from "./tools";
 
 export interface Answer {
   covered: boolean;
+  // True when every topic this answer drew on is marked autonomous, so the
+  // reply may be sent to the customer rather than posted as a note. Computed
+  // here, from the loaded knowledge base — never taken from the model.
+  sendable?: boolean;
+  // Step markers for the branding-removal script, reported by the model rather
+  // than guessed from the text: one asks the merchant to confirm their store,
+  // the other asks for a review. Both drive what the next message may do.
+  asked_to_confirm?: boolean;
+  asked_for_review?: boolean;
+  // Whether a person is actually waiting on this. False for newsletters, spam
+  // and automated noise, which must not be routed to an operator. Absent is
+  // read as true: failing toward a human is the safe direction.
+  needs_human?: boolean;
   // Tools the model actually called, and whether any of them changed the
   // merchant's account. Surfaced so a completed action is never buried inside
   // a reply that reads like a suggestion.
@@ -27,6 +41,7 @@ export interface Answer {
 
 const NOT_COVERED: Answer = {
   covered: false,
+  needs_human: true,
   messages: [],
   topics_used: [],
   reason: "The knowledge base could not be loaded.",
@@ -37,7 +52,8 @@ export async function answerQuestion(
   question: string,
   history: { role: "user" | "assistant"; content: string }[] = [],
   siteContext: SiteContext | null = null,
-  apiKey: string | null = null
+  apiKey: string | null = null,
+  flow: FlowState | null = null
 ): Promise<Answer> {
   const kb = await loadKnowledgeBase(env);
   if (!kb) return NOT_COVERED;
@@ -46,6 +62,7 @@ export async function answerQuestion(
   if (!rendered) {
     return {
       covered: false,
+      needs_human: true,
       messages: [],
       topics_used: [],
       reason: explainEmpty(kb.allTopics, kb.allQaPairs),
@@ -66,6 +83,11 @@ export async function answerQuestion(
     // prefix on every single message.
     ...(contextBlock
       ? [{ type: "text" as const, text: `# This merchant\n\n${contextBlock}` }]
+      : []),
+    // Where the branding-removal script is up to. Also after the breakpoint:
+    // it changes on every message by design.
+    ...(flow && renderFlow(flow)
+      ? [{ type: "text" as const, text: `# This conversation\n\n${renderFlow(flow)}` }]
       : []),
     // Say the quiet part explicitly. Without this the model has a knowledge base
     // entry about removing the watermark, an instruction not to promise someone
@@ -143,6 +165,15 @@ export async function answerQuestion(
   const text =
     (json?.content ?? []).find((b: any) => b.type === "text")?.text ?? "";
   const toolsUsed = outcomes.map((o) => o.name);
+
+  // An answer is sendable only if it named topics AND all of them are
+  // autonomous. No topics means we cannot tell what it drew on, which is not a
+  // basis for talking to a customer.
+  const sendable = (topics: string[] | undefined) =>
+    Array.isArray(topics) &&
+    topics.length > 0 &&
+    topics.every((t) => kb.autonomousTopics.has(t));
+
   const actionsTaken = outcomes.filter((o) => o.mutated).map((o) => o.name);
 
   if (json.stop_reason === "refusal") {
@@ -171,9 +202,24 @@ export async function answerQuestion(
     // A malformed "covered: true" with nothing to say would post an empty
     // reply, so treat it as not covered.
     if (parsed.covered && !messages.length) {
-      return { covered: false, messages: [], topics_used: [], reason: "Empty answer.", usage, tools_used: toolsUsed, actions_taken: actionsTaken };
+      return { covered: false, needs_human: true, messages: [], topics_used: [], reason: "Empty answer.", usage, tools_used: toolsUsed, actions_taken: actionsTaken };
     }
-    return { ...parsed, messages, usage, tools_used: toolsUsed, actions_taken: actionsTaken };
+    // Only an explicit false counts as "nobody is waiting on this".
+    const needsHuman = parsed.needs_human !== false;
+    // A review ask is only recorded when the model says so explicitly; guessing
+    // from the text would eventually mislabel and ask someone twice.
+    const askedForReview = parsed.asked_for_review === true;
+    return {
+      ...parsed,
+      needs_human: needsHuman,
+      sendable: parsed.covered === true && sendable(parsed.topics_used),
+      asked_to_confirm: parsed.asked_to_confirm === true,
+      asked_for_review: askedForReview,
+      messages,
+      usage,
+      tools_used: toolsUsed,
+      actions_taken: actionsTaken,
+    };
   } catch {
     console.error("Unparseable answer. stop_reason:", json.stop_reason, "text:", text.slice(0, 300));
     return { ...NOT_COVERED, reason: "The answering service returned an unreadable response.", usage, tools_used: toolsUsed, actions_taken: actionsTaken };
