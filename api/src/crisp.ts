@@ -228,28 +228,17 @@ export async function getHandoffCandidates(env: Env) {
     .map((o) => o.user_id);
 }
 
-// Is ANY operator present, whether or not they're eligible to be handed work?
-// This deliberately ignores HANDOFF_EXCLUDED: the exclusion list says who
-// should not be ASSIGNED a conversation, not who is sitting at a desk. Somebody
-// excluded can still read a suggested note and send it, so their presence is
-// enough to keep the bot from speaking for itself.
+// Is anyone on shift who could actually deal with a conversation? Excluded
+// operators never count, even when Crisp says they are online: they are not
+// handed work, so their presence does not mean a suggested note will be read.
+// Treating them as staff is how a draft sits unsent while the bot stays quiet.
 //
 // Returns null when availability could not be read. Callers must treat that as
 // "someone is probably around" — guessing the room is empty is how the bot ends
 // up talking to customers over the top of a working agent.
 export async function isAnyoneOnline(env: Env): Promise<boolean | null> {
-  const response = await fetch(
-    `https://api.crisp.chat/v1/website/${WEBSITE_ID}/availability/operators`,
-    { headers: authHeaders(env) }
-  );
-
-  if (!response.ok) {
-    console.error("Crisp availability failed:", response.status);
-    return null;
-  }
-
-  const json = (await response.json()) as { data?: Availability[] };
-  return (json.data ?? []).some((o) => o.type === "online");
+  const candidates = await getHandoffCandidates(env);
+  return candidates === null ? null : candidates.length > 0;
 }
 
 // Everyone eligible whether or not they're online, for the out-of-hours case
