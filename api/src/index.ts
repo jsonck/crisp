@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { dailySummary } from "./crons/daily-summary";
 import { answerQuestion } from "./answer";
-import { handleCrispMessage, BOT_ENABLED } from "./webhook";
+import { handleCrispMessage, BOT_ENABLED, BOT_MUTED } from "./webhook";
 import { verifySignature } from "./crisp";
 import { planHandoff } from "./handoff";
 import { isAnyoneOnline } from "./crisp";
@@ -51,10 +51,16 @@ app.get("/", (c) => {
 // Render pings this to decide whether the instance is healthy. Deliberately
 // does no I/O: a health check that talks to Supabase turns someone else's
 // outage into our instance being replaced.
-// `bot_enabled` is here so you can tell which way the deployed copy has the
-// switch set — the first thing you want to check when the bot has gone quiet.
+// Both switches are reported so you can tell which way the deployed copy has
+// them set — the first thing to check when the bot has gone quiet. Off means
+// nothing is even logged; muted means it is all logged and none of it sent.
 app.get("/health", (c) =>
-  c.json({ ok: true, uptime: process.uptime(), bot_enabled: BOT_ENABLED })
+  c.json({
+    ok: true,
+    uptime: process.uptime(),
+    bot_enabled: BOT_ENABLED,
+    bot_muted: BOT_MUTED,
+  })
 );
 
 // Manual trigger for testing

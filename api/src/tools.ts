@@ -55,7 +55,15 @@ export interface ToolOutcome {
   // True when the call changed something on the merchant's account, so callers
   // can surface it rather than burying it in a suggested reply.
   mutated: boolean;
+  // True when the call was refused because writes are switched off (muted
+  // mode). The model was told nothing happened, and nothing did.
+  withheld?: boolean;
 }
+
+// Tools that change the merchant's account rather than reading it. Muted mode
+// refuses exactly these; everything else is a lookup and stays available, so a
+// muted draft is still the draft the bot would really have written.
+export const MUTATING_TOOLS = new Set(["remove_watermark"]);
 
 async function pc(env: Env, path: string, apiKey: string, method = "GET") {
   const response = await fetch(
@@ -72,7 +80,8 @@ async function pc(env: Env, path: string, apiKey: string, method = "GET") {
 export async function runTool(
   env: Env,
   name: string,
-  apiKey: string | null
+  apiKey: string | null,
+  allowWrites = true
 ): Promise<ToolOutcome> {
   // No resolved store means no tool may run. Without this the model could be
   // talked into acting on an unidentified conversation.
@@ -81,6 +90,18 @@ export async function runTool(
       name,
       mutated: false,
       result: { error: "This conversation is not linked to a store, so account actions are unavailable." },
+    };
+  }
+
+  // Muted: the lookups still run, the changes do not. The wording is flat on
+  // purpose — it states that nothing changed and stops there, so the draft the
+  // model writes next is its own choice rather than one this string dictated.
+  if (!allowWrites && MUTATING_TOOLS.has(name)) {
+    return {
+      name,
+      mutated: false,
+      withheld: true,
+      result: { error: "Account changes are switched off right now. Nothing has been changed." },
     };
   }
 

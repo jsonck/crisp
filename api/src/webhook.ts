@@ -37,7 +37,11 @@ const MESSAGE_GAP_MS = 1200;
 const REPLY_WHEN_UNSTAFFED = process.env.REPLY_WHEN_UNSTAFFED !== "false";
 
 // The master off switch. Set this to false and deploy, and the bot ignores
-// every incoming message: no notes, no replies, no tools, no handoffs.
+// every incoming message: no notes, no replies, no tools, no handoffs — and
+// no row in bot_suggestions either, so "off" also means blind. That cost us a
+// day of visibility once: a drop in watermark requests looked like a broken
+// flow in the Shopify app until /health showed the bot had simply been off.
+// If you want the record without the behaviour, use BOT_MUTED instead.
 //
 // A constant rather than an env var on purpose. Render only picks up an env
 // change on a fresh deploy — a restart reuses the old environment — so the env
@@ -47,7 +51,22 @@ const REPLY_WHEN_UNSTAFFED = process.env.REPLY_WHEN_UNSTAFFED !== "false";
 // Deliberately NOT applied to the /answer endpoint — the KB tester stays
 // usable while the bot is off, which is the whole point of being able to turn
 // it off and keep working on it.
-export const BOT_ENABLED = false;
+export const BOT_ENABLED = true;
+
+// Observation mode: do everything, say nothing. The pipeline runs in full —
+// conversation fetched, lookups made, draft written, send decision taken — and
+// then every outbound call is skipped: no customer message, no internal note,
+// no handoff, and no account change (remove_watermark is refused in tools.ts).
+// The row in bot_suggestions is written as usual, with `muted` true and the
+// suppressed decision in `would_send_reason` / `withheld_actions`.
+//
+// This is the switch to reach for when the bot is misbehaving but you still
+// want the data: BOT_ENABLED=false tells you nothing about what it would have
+// done, and a week of muted rows tells you exactly.
+//
+// It costs a real Anthropic call per message and still reads the merchant's
+// account, so it is not free — just harmless to the customer.
+export const BOT_MUTED = true;
 
 interface WebhookBody {
   event?: string;
@@ -186,7 +205,7 @@ export async function handleCrispMessage(env: Env, body: WebhookBody) {
   const flow = await loadFlow(env, sessionId, session.qualification);
   if (session.storeUrl && !flow.storeUrl) flow.storeUrl = session.storeUrl;
 
-  const result = await answerQuestion(env, question, history, siteContext, apiKey, flow);
+  const result = await answerQuestion(env, question, history, siteContext, apiKey, flow, BOT_MUTED);
 
   // An action the bot already performed must never read as a suggestion. In note
   // mode the customer is told nothing, so the agent has to send the reply - and
@@ -206,8 +225,11 @@ export async function handleCrispMessage(env: Env, body: WebhookBody) {
   };
 
   // Not covered, and a real person is waiting: bring in a human and say so.
-  // This is the branch that used to do nothing at all.
-  if (!result.covered && result.needs_human !== false) {
+  // This is the branch that used to do nothing at all. Muted skips it — a
+  // handoff both assigns an operator and speaks to the customer, and the row
+  // records the decision anyway (covered false plus needs_human true is
+  // exactly the condition that would have fired it).
+  if (!result.covered && result.needs_human !== false && !BOT_MUTED) {
     const announce = !(await alreadyHandedOff(env, sessionId));
     handoff = await performHandoff(env, sessionId, result.reason ?? null, announce);
   }
@@ -227,7 +249,20 @@ export async function handleCrispMessage(env: Env, body: WebhookBody) {
       ? "nobody_online"
       : null;
 
-  if (result.covered && result.messages.length && sendReason) {
+  // Muted: the send decision above was still taken and is still recorded, it
+  // just does not happen. Nothing is posted as a note either — a note is a
+  // message in the conversation, and the team should not be reading drafts the
+  // bot was told to keep to itself.
+  if (BOT_MUTED) {
+    console.log(
+      `BOT_MUTED, nothing sent for ${sessionId}:`,
+      JSON.stringify({
+        covered: result.covered,
+        would_send_reason: sendReason,
+        withheld: result.withheld_actions ?? [],
+      })
+    );
+  } else if (result.covered && result.messages.length && sendReason) {
     for (const [i, message] of result.messages.entries()) {
       if (i > 0) await new Promise((r) => setTimeout(r, MESSAGE_GAP_MS));
       const ok = await sendMessage(env, sessionId, message);
@@ -284,7 +319,9 @@ export async function handleCrispMessage(env: Env, body: WebhookBody) {
   // The removal is a real account change and is recorded either way. The two
   // conversational steps only count if the customer actually SAW them — a reply
   // that stayed a private note asked them nothing, and recording it would make
-  // the next turn skip a step the merchant never received.
+  // the next turn skip a step the merchant never received. Muting needs no
+  // special case here for the same reason: nothing was sent, so `sent` is
+  // false, and a muted turn moves the flow nowhere.
   const removedNow = (result.actions_taken ?? []).includes("remove_watermark");
   const askedConfirmNow = sent && result.asked_to_confirm === true;
   const askedReviewNow = sent && result.asked_for_review === true;
@@ -306,6 +343,11 @@ export async function handleCrispMessage(env: Env, body: WebhookBody) {
     posted_note: posted,
     reply_sent: sent,
     send_reason: sent ? sendReason : null,
+    muted: BOT_MUTED,
+    // The decision muting suppressed. Kept out of send_reason so that column
+    // keeps meaning "what we really said to a customer". See 0010.
+    would_send_reason: BOT_MUTED ? sendReason : null,
+    withheld_actions: result.withheld_actions ?? [],
     usage: result.usage ?? null,
     site_resolved: Boolean(siteContext),
     tools_used: result.tools_used ?? [],

@@ -30,6 +30,9 @@ export interface Answer {
   // a reply that reads like a suggestion.
   tools_used?: string[];
   actions_taken?: string[];
+  // Mutating tools the model called while muted, and so was refused. Lives
+  // beside actions_taken rather than in it: that list means "really happened".
+  withheld_actions?: string[];
   // One chat message per entry, the way a person types in a live chat rather
   // than one considered paragraph. Usually length 1.
   messages: string[];
@@ -53,7 +56,12 @@ export async function answerQuestion(
   history: { role: "user" | "assistant"; content: string }[] = [],
   siteContext: SiteContext | null = null,
   apiKey: string | null = null,
-  flow: FlowState | null = null
+  flow: FlowState | null = null,
+  // Muted mode: lookups still run, account changes are refused. Nothing else
+  // about the call changes — same prompt, same tools offered — because a draft
+  // produced under a different prompt would not be the draft the bot would
+  // really have written, and watching that draft is the point of muting.
+  muted = false
 ): Promise<Answer> {
   const kb = await loadKnowledgeBase(env);
   if (!kb) return NOT_COVERED;
@@ -149,7 +157,7 @@ export async function answerQuestion(
 
     const results = [];
     for (const call of calls) {
-      const outcome = await runTool(env, call.name, apiKey);
+      const outcome = await runTool(env, call.name, apiKey, !muted);
       outcomes.push(outcome);
       results.push({
         type: "tool_result",
@@ -175,9 +183,10 @@ export async function answerQuestion(
     topics.every((t) => kb.autonomousTopics.has(t));
 
   const actionsTaken = outcomes.filter((o) => o.mutated).map((o) => o.name);
+  const withheldActions = outcomes.filter((o) => o.withheld).map((o) => o.name);
 
   if (json.stop_reason === "refusal") {
-    return { ...NOT_COVERED, reason: "The answering service declined this request.", usage, tools_used: toolsUsed, actions_taken: actionsTaken };
+    return { ...NOT_COVERED, reason: "The answering service declined this request.", usage, tools_used: toolsUsed, actions_taken: actionsTaken, withheld_actions: withheldActions };
   }
 
   try {
@@ -202,7 +211,7 @@ export async function answerQuestion(
     // A malformed "covered: true" with nothing to say would post an empty
     // reply, so treat it as not covered.
     if (parsed.covered && !messages.length) {
-      return { covered: false, needs_human: true, messages: [], topics_used: [], reason: "Empty answer.", usage, tools_used: toolsUsed, actions_taken: actionsTaken };
+      return { covered: false, needs_human: true, messages: [], topics_used: [], reason: "Empty answer.", usage, tools_used: toolsUsed, actions_taken: actionsTaken, withheld_actions: withheldActions };
     }
     // Only an explicit false counts as "nobody is waiting on this".
     const needsHuman = parsed.needs_human !== false;
@@ -219,9 +228,10 @@ export async function answerQuestion(
       usage,
       tools_used: toolsUsed,
       actions_taken: actionsTaken,
+      withheld_actions: withheldActions,
     };
   } catch {
     console.error("Unparseable answer. stop_reason:", json.stop_reason, "text:", text.slice(0, 300));
-    return { ...NOT_COVERED, reason: "The answering service returned an unreadable response.", usage, tools_used: toolsUsed, actions_taken: actionsTaken };
+    return { ...NOT_COVERED, reason: "The answering service returned an unreadable response.", usage, tools_used: toolsUsed, actions_taken: actionsTaken, withheld_actions: withheldActions };
   }
 }
