@@ -36,6 +36,18 @@ const MESSAGE_GAP_MS = 1200;
 // it is the kill switch for everything this constant enables.
 const REPLY_WHEN_UNSTAFFED = process.env.REPLY_WHEN_UNSTAFFED !== "false";
 
+// The master off switch. BOT_ENABLED=false makes the bot ignore every incoming
+// message: no notes, no replies, no tools, no handoffs. Read per call rather
+// than once at boot so flipping it in the Render dashboard takes effect on the
+// restart Render does anyway, and so a test can set it without re-importing.
+//
+// Deliberately NOT applied to the /answer endpoint — the KB tester stays
+// usable while the bot is off, which is the whole point of being able to turn
+// it off and keep working on it.
+export function botEnabled() {
+  return process.env.BOT_ENABLED !== "false";
+}
+
 interface WebhookBody {
   event?: string;
   website_id?: string;
@@ -85,6 +97,14 @@ export async function handleCrispMessage(env: Env, body: WebhookBody) {
   const data = body.data ?? {};
   const sessionId = data.session_id;
   const websiteId = data.website_id ?? body.website_id;
+
+  // Checked before the fingerprint claim, so a message that arrives while the
+  // bot is off is left completely untouched: nothing written, nothing to undo,
+  // and the next message after it is switched back on is handled normally.
+  if (!botEnabled()) {
+    console.log("BOT_ENABLED=false, ignoring:", sessionId ?? "(no session)");
+    return;
+  }
 
   // `message:send` is visitor -> operators. The bot's own notes fire
   // `message:received`, so this alone prevents a self-reply loop; the
