@@ -36,17 +36,18 @@ const MESSAGE_GAP_MS = 1200;
 // it is the kill switch for everything this constant enables.
 const REPLY_WHEN_UNSTAFFED = process.env.REPLY_WHEN_UNSTAFFED !== "false";
 
-// The master off switch. BOT_ENABLED=false makes the bot ignore every incoming
-// message: no notes, no replies, no tools, no handoffs. Read per call rather
-// than once at boot so flipping it in the Render dashboard takes effect on the
-// restart Render does anyway, and so a test can set it without re-importing.
+// The master off switch. Set this to false and deploy, and the bot ignores
+// every incoming message: no notes, no replies, no tools, no handoffs.
+//
+// A constant rather than an env var on purpose. Render only picks up an env
+// change on a fresh deploy — a restart reuses the old environment — so the env
+// var bought nothing a deploy does not, and cost a dashboard edit that is
+// invisible in the repo. Here, git says who turned the bot off and when.
 //
 // Deliberately NOT applied to the /answer endpoint — the KB tester stays
 // usable while the bot is off, which is the whole point of being able to turn
 // it off and keep working on it.
-export function botEnabled() {
-  return process.env.BOT_ENABLED !== "false";
-}
+export const BOT_ENABLED = false;
 
 interface WebhookBody {
   event?: string;
@@ -101,8 +102,8 @@ export async function handleCrispMessage(env: Env, body: WebhookBody) {
   // Checked before the fingerprint claim, so a message that arrives while the
   // bot is off is left completely untouched: nothing written, nothing to undo,
   // and the next message after it is switched back on is handled normally.
-  if (!botEnabled()) {
-    console.log("BOT_ENABLED=false, ignoring:", sessionId ?? "(no session)");
+  if (!BOT_ENABLED) {
+    console.log("BOT_ENABLED is false, ignoring:", sessionId ?? "(no session)");
     return;
   }
 

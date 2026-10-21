@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { dailySummary } from "./crons/daily-summary";
 import { answerQuestion } from "./answer";
-import { handleCrispMessage, botEnabled } from "./webhook";
+import { handleCrispMessage, BOT_ENABLED } from "./webhook";
 import { verifySignature } from "./crisp";
 import { planHandoff } from "./handoff";
 import { isAnyoneOnline } from "./crisp";
@@ -51,11 +51,10 @@ app.get("/", (c) => {
 // Render pings this to decide whether the instance is healthy. Deliberately
 // does no I/O: a health check that talks to Supabase turns someone else's
 // outage into our instance being replaced.
-// `bot_enabled` is here so the off switch can be confirmed from outside the
-// Render dashboard — the one thing you want to check first when the bot has
-// gone quiet.
+// `bot_enabled` is here so you can tell which way the deployed copy has the
+// switch set — the first thing you want to check when the bot has gone quiet.
 app.get("/health", (c) =>
-  c.json({ ok: true, uptime: process.uptime(), bot_enabled: botEnabled() })
+  c.json({ ok: true, uptime: process.uptime(), bot_enabled: BOT_ENABLED })
 );
 
 // Manual trigger for testing

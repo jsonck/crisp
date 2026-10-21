@@ -32,8 +32,3 @@ services:
         sync: false
       - key: MAILGUN_KEY
         sync: false
-      # The off switch. Unset means on; set it to the string "false" in the
-      # dashboard to make the bot ignore every incoming message. `sync: false`
-      # so a deploy never silently switches it back on.
-      - key: BOT_ENABLED
-        sync: false
