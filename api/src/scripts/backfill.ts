@@ -9,6 +9,7 @@
 //   --pages <n>           stop after n pages of 20 (default: no limit)
 //   --all                 re-sync conversations already marked complete
 //   --tags-only           skip the walk, just rebuild kb tags from bot_suggestions
+//   --sessions <a,b,c>    sync only these session ids, skipping the walk
 //
 // Every write is an upsert keyed on ids Crisp already assigns, so running this
 // twice changes nothing the first run did not already do. By default it skips
@@ -58,18 +59,31 @@ const env = {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-// A single dropped connection should not end an hour-long walk. Three tries
+// A single dropped connection should not end an hour-long walk. Four tries
 // with a widening gap, then give up on THAT conversation and carry on — the
 // run is resumable, so one skipped conversation costs a re-run, not a restart.
+//
+// Retries on a null return as well as on a throw: the Crisp helpers log and
+// return null rather than throwing, so a try/catch alone silently let every
+// rate-limited conversation through as a permanent failure.
+//
+// The backoff is in tens of seconds because the failure this exists for is
+// Crisp's 429, and that is a quota window, not a blip — a long walk exhausts
+// the hour's allowance and then every subsequent call fails identically. Short
+// retries just burn the remaining allowance faster. 30/60/90s rides out a
+// short throttle; a genuinely spent hourly quota needs a later re-run, and
+// the walk is resumable precisely so that costs nothing.
 async function withRetry<T>(label: string, fn: () => Promise<T>): Promise<T | null> {
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  for (let attempt = 1; attempt <= 4; attempt++) {
     try {
-      return await fn();
+      const result = await fn();
+      if (result !== null) return result;
+      console.error(`${label} returned nothing (attempt ${attempt}/4)`);
     } catch (e) {
-      console.error(`${label} failed (attempt ${attempt}/3):`, (e as Error)?.message ?? e);
-      if (attempt === 3) return null;
-      await sleep(attempt * 2000);
+      console.error(`${label} failed (attempt ${attempt}/4):`, (e as Error)?.message ?? e);
     }
+    if (attempt === 4) return null;
+    await sleep(attempt * 30_000);
   }
   return null;
 }
@@ -179,8 +193,47 @@ async function alreadyMirrored(): Promise<Set<string>> {
   return seen;
 }
 
+// Sync named conversations without walking the list. Crisp rate-limits a long
+// run, and when a handful of conversations fall out of a 3000-conversation
+// walk to a 429, re-walking the whole list to find them costs another 150 list
+// calls and risks the same 429.
+async function syncNamed(ids: string[]) {
+  let synced = 0;
+
+  for (const sessionId of ids) {
+    const history = await withRetry(`messages ${sessionId}`, () =>
+      fetchAllMessages(env, sessionId)
+    );
+    if (!history) {
+      console.error("Still could not read", sessionId);
+      continue;
+    }
+
+    // No conversation-list entry here, so the metadata Crisp returns on the
+    // list (nickname, email, api_key) is not available — the transcript is,
+    // and the next nightly sync fills the rest in.
+    const written = await withRetry(`sync ${sessionId}`, () =>
+      syncConversation(env, sessionId, history, { websiteId: WEBSITE_ID, complete: true })
+    );
+
+    if (written === null) continue;
+    synced++;
+    console.log(`  ${sessionId}: ${written} messages`);
+    await sleep(PAUSE_MS);
+  }
+
+  console.log(`Done: ${synced}/${ids.length} conversations synced`);
+}
+
 async function main() {
   if (flag("tags-only")) {
+    await backfillKbTags();
+    return;
+  }
+
+  const named = arg("sessions");
+  if (named) {
+    await syncNamed(named.split(",").map((id) => id.trim()).filter(Boolean));
     await backfillKbTags();
     return;
   }
