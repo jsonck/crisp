@@ -47,6 +47,13 @@ export async function dailySummary(env: Env) {
   const yesterday = getYesterdayRange();
   const conversations = await fetchYesterdayConversations(env, yesterday);
 
+  // No email and no row: a day we could not read must stay visibly missing so
+  // the next run (or a person) can tell it apart from a day with nothing in it.
+  if (conversations === null) {
+    console.error("Daily summary aborted: Crisp would not list conversations");
+    return;
+  }
+
   if (conversations.length === 0) {
     const emailedEmpty = await sendEmail(env, formatEmptyDay(yesterday.dateStr));
     // Still recorded. A day with no conversations is a real data point, and a
@@ -171,15 +178,30 @@ function getYesterdayRange() {
   return { startOfDay, endOfDay, dateStr, isoDate };
 }
 
+// Null means Crisp would not answer — which is NOT the same as a quiet day,
+// and the difference matters: treating a refusal as an empty list emails
+// "no conversations yesterday 🎉" and writes a daily_summaries row claiming
+// zero, which is then indistinguishable from a real quiet day forever after.
+// Crisp's plugin token has a request quota and does run out, so this is a
+// thing that happens, not a hypothetical.
 async function fetchYesterdayConversations(
   env: Env,
   yesterday: { startOfDay: number; endOfDay: number }
-): Promise<Conversation[]> {
+): Promise<Conversation[] | null> {
   const all: Conversation[] = [];
 
   for (let page = 1; page <= 50; page++) {
     const data = await listConversations(env, page);
-    if (!data || data.length === 0) break;
+
+    // A failure on the first page means we know nothing; on a later page we
+    // have a partial day, which is still worth summarising — and saying so.
+    if (data === null) {
+      if (page === 1) return null;
+      console.error(`Crisp stopped answering at page ${page}; summarising a partial day`);
+      break;
+    }
+
+    if (data.length === 0) break;
 
     for (const conv of data) {
       const updatedAt = conv.updated_at ?? 0;

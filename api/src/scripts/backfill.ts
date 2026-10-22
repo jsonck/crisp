@@ -15,6 +15,18 @@
 // twice changes nothing the first run did not already do. By default it skips
 // conversations that are already complete, which makes a interrupted run cheap
 // to resume — pass --all to force a full re-read.
+//
+// MIND THE QUOTA. A full walk is one Crisp call per conversation (more for
+// long ones), and the plugin token has a request quota: mirroring ~3500
+// conversations exhausted it, after which Crisp 429s EVERY request from this
+// token — the live webhook included, which then cannot read the conversation
+// it was woken for. Nothing is lost (the bot logs the failure and the nightly
+// sync fills the gap), but plan a full walk for a quiet hour, and if this is
+// going to be run often, get a production token from the Crisp Marketplace.
+//
+// A resumed run is cheap by comparison: already-complete conversations are
+// skipped from the list page without fetching their messages, so picking up
+// a handful of stragglers costs the list calls plus those few conversations.
 
 import {
   WEBSITE_ID,
