@@ -201,23 +201,41 @@ create view conversation_daily with (security_invoker = on) as
 
 -- How long a visitor waited for a human. The metric the old email could never
 -- produce, and the one most likely to justify letting the bot off the leash.
+--
+-- "Operator" is not the same as "a person": Crisp's auto-responder posts as an
+-- operator within about three seconds ("Thanks for reaching out!"), and
+-- counting it put the median first reply at 18 seconds — a number that
+-- measured the autoresponder and nothing else. Plugin-origin messages
+-- (urn:crisp.im:*) are therefore excluded from the human reply, and reported
+-- separately so the autoresponder's own coverage stays visible.
 create view conversation_first_response with (security_invoker = on) as
   select
     m.session_id,
     date_trunc('day', min(m.sent_at) filter (where m.from_role = 'user'))::date as day,
     min(m.sent_at) filter (where m.from_role = 'user') as first_user_at,
-    min(m.sent_at) filter (where m.from_role = 'operator' and not m.is_note) as first_reply_at,
+    min(m.sent_at) filter (
+      where m.from_role = 'operator' and not m.is_note
+        and (m.origin is null or m.origin not like 'urn:%')
+    ) as first_reply_at,
+    min(m.sent_at) filter (
+      where m.from_role = 'operator' and not m.is_note and m.origin like 'urn:%'
+    ) as first_auto_reply_at,
     extract(epoch from
-      min(m.sent_at) filter (where m.from_role = 'operator' and not m.is_note)
+      min(m.sent_at) filter (
+        where m.from_role = 'operator' and not m.is_note
+          and (m.origin is null or m.origin not like 'urn:%')
+      )
       - min(m.sent_at) filter (where m.from_role = 'user')
     ) as first_response_seconds
   from conversation_messages m
   group by m.session_id;
 
 comment on view conversation_first_response is
-  'Null first_reply_at means nobody ever answered. Negative seconds means the
-   operator spoke first (an outbound conversation) — filter both out before
-   averaging.';
+  'Time to the first message from a named agent. Null first_reply_at means
+   nobody ever answered; negative seconds means the operator spoke first (an
+   outbound conversation) — filter both out before averaging.
+   Caveat worth knowing before quoting it: the team opens with a canned
+   greeting, so this measures responsiveness, not time-to-an-answer.';
 
 -- ---------------------------------------------------------------------------
 -- RLS. Written by the worker (service_role, bypasses RLS); editors read.

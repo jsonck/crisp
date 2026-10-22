@@ -80,6 +80,11 @@ const identifiedShare = computed(() => {
   return Math.round((identified / total) * 100);
 });
 
+// Named for what it measures. Excluding the auto-responder brought this to
+// the first message from a named agent — which the team sends as a canned
+// greeting within seconds ("Hey there! Don here from CartKit"), so it is a
+// real number about responsiveness, not time-to-an-answer. Separating those
+// needs a judgement about message content that the data alone cannot make.
 const medianLabel = computed(() => {
   const seconds = medianReply.value;
   if (seconds == null) return "—";
@@ -209,7 +214,7 @@ function when(iso: string | null) {
         </div>
         <div class="tile">
           <span class="value">{{ medianLabel }}</span>
-          <span class="label">median first reply</span>
+          <span class="label">median first operator message</span>
         </div>
         <div class="tile">
           <span class="value">{{ identifiedShare == null ? "—" : identifiedShare + "%" }}</span>
