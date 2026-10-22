@@ -48,10 +48,10 @@ export async function dailySummary(env: Env) {
   const conversations = await fetchYesterdayConversations(env, yesterday);
 
   if (conversations.length === 0) {
-    await sendEmail(env, formatEmptyDay(yesterday.dateStr));
+    const emailedEmpty = await sendEmail(env, formatEmptyDay(yesterday.dateStr));
     // Still recorded. A day with no conversations is a real data point, and a
     // gap in the table would be indistinguishable from a night the cron failed.
-    await saveDailySummary(env, yesterday.isoDate, 0, { empty: true }, true);
+    await saveDailySummary(env, yesterday.isoDate, 0, { empty: true }, emailedEmpty);
     return;
   }
 
@@ -93,12 +93,12 @@ export async function dailySummary(env: Env) {
 
   // Format and send
   const html = formatSummaryEmail(yesterday.dateStr, analysis);
-  await sendEmail(env, html);
+  const emailed = await sendEmail(env, html);
 
   // Keep the analysis. It used to exist only inside that email, which meant no
   // two days could ever be compared — the single biggest reason this bot had
   // no sense of a trend.
-  await saveDailySummary(env, yesterday.isoDate, analysis.total_count, analysis, true);
+  await saveDailySummary(env, yesterday.isoDate, analysis.total_count, analysis, emailed);
   await persistTags(env, conversationsWithMessages.map((c) => c.session_id), analysis);
 }
 
@@ -225,10 +225,10 @@ Analyze these conversations and respond with valid JSON only (no markdown fences
 
 {
   "escalated": [
-    { "nickname": "<customer name>", "email": "<email>", "session_id": "<session_id from the transcript>", "reason": "<brief reason why this was escalated or problematic>" }
+    { "session_id": "<session_id from the transcript>", "reason": "<brief reason why this was escalated or problematic>" }
   ],
   "went_well": [
-    { "nickname": "<customer name>", "email": "<email>", "session_id": "<session_id from the transcript>", "reason": "<brief reason why this went well>" }
+    { "session_id": "<session_id from the transcript>", "reason": "<brief reason why this went well>" }
   ],
   "classified": [
     { "session_id": "<session_id from the transcript>", "topic": "<Parent Category>", "subtopic": "<specific subtopic>" }
@@ -237,6 +237,7 @@ Analyze these conversations and respond with valid JSON only (no markdown fences
 }
 
 Rules:
+- Identify every conversation by its session_id only. Names and emails are already known here and copying them back wastes output and invents typos.
 - "escalated": conversations where the customer was frustrated/angry, the issue wasn't resolved, the agent struggled, or the customer threatened to leave/asked for a refund. Be selective — only flag truly problematic ones.
 - "went_well": conversations where the customer expressed gratitude, the issue was resolved quickly, or the agent went above and beyond. Be selective — only flag genuinely positive ones.
 - "classified": one entry for EVERY conversation, with no conversation left out and none listed twice. Group them into a small set of parent categories, each broken into a specific subtopic. Reuse the same category and subtopic wording across conversations — these become tags, and "Billing" and "billing questions" as two separate tags make a month of data uncountable.`;
@@ -250,7 +251,12 @@ Rules:
     },
     body: JSON.stringify({
       model: "claude-sonnet-4-6",
-      max_tokens: 4096,
+      // 4096 was not enough: a day of 44 conversations truncated the JSON
+      // mid-string and the whole analysis was lost to a parse error (the
+      // fallback is empty arrays, so the email silently lost its topics).
+      // The response is one line per conversation plus two short lists, so it
+      // scales with the day; 16k leaves room for a busy one.
+      max_tokens: 16000,
       messages: [{ role: "user", content: prompt }],
     }),
   });
@@ -271,7 +277,27 @@ Rules:
 
   try {
     const parsed = JSON.parse(text) as AnalysisResult;
-    return { ...parsed, topics: rollUp(parsed.classified ?? []) };
+
+    // The model is given session_ids and returns them; the names come from
+    // Crisp, where they are already correct. A session_id it invented resolves
+    // to nothing and is dropped rather than printed as "undefined".
+    const names = new Map(
+      conversations.map((c) => [
+        c.session_id,
+        { nickname: c.meta?.nickname || "Unknown", email: c.meta?.email || "no email" },
+      ])
+    );
+    const name = (rows: ConversationSummary[] = []) =>
+      rows
+        .filter((r) => r?.session_id && names.has(r.session_id))
+        .map((r) => ({ ...r, ...names.get(r.session_id)! }));
+
+    return {
+      ...parsed,
+      escalated: name(parsed.escalated),
+      went_well: name(parsed.went_well),
+      topics: rollUp(parsed.classified ?? []),
+    };
   } catch {
     console.error("Failed to parse Claude response. stop_reason:", stopReason, "text:", text?.substring(0, 500));
     return { conversations: [], escalated: [], went_well: [], topics: [], classified: [], total_count: conversations.length };
@@ -357,6 +383,8 @@ function formatEmptyDay(dateStr: string): string {
   `;
 }
 
+// Returns whether the mail actually went out, so `daily_summaries.emailed`
+// records what happened instead of asserting that it did.
 async function sendEmail(env: Env, html: string) {
   const dateStr = new Date().toLocaleDateString("en-US", {
     weekday: "long",
@@ -385,5 +413,8 @@ async function sendEmail(env: Env, html: string) {
 
   if (!response.ok) {
     console.error("Mailgun error:", await response.text());
+    return false;
   }
+
+  return true;
 }
