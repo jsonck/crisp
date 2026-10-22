@@ -10,6 +10,7 @@ import {
   type CrispMessage,
 } from "./crisp";
 import { loadFlow, recordFlow } from "./flow";
+import { syncConversation, syncKbTags, setConversationApiKey } from "./log";
 import { performHandoff, HANDOFF_QUIET_WINDOW_MS } from "./handoff";
 import { fetchSiteContext } from "./site";
 
@@ -169,6 +170,16 @@ export async function handleCrispMessage(env: Env, body: WebhookBody) {
     return;
   }
 
+  // Mirror what we just fetched. Deliberately before every early return below:
+  // a conversation an operator is already handling is one the bot says nothing
+  // about, and those are exactly the ones `bot_suggestions` could never see.
+  // `complete: false` — this is the last page of messages, not the history.
+  // A webhook that cannot write the mirror must still answer the customer, so
+  // this is logged and swallowed rather than thrown.
+  await syncConversation(env, sessionId, messages, { websiteId }).catch((e) =>
+    console.error("Conversation mirror failed:", e)
+  );
+
   // Stay quiet if a human is already in the thread. Notes are internal, but an
   // agent mid-conversation does not need the bot talking over them.
   const lastOperator = messages
@@ -199,6 +210,15 @@ export async function handleCrispMessage(env: Env, body: WebhookBody) {
   const session = await getSessionContext(env, sessionId);
   const apiKey = session.apiKey;
   const siteContext = await fetchSiteContext(env, apiKey);
+
+  // The mirror was written before the store was resolved, so fill it in now.
+  // "How many of our conversations can we even attribute to a merchant" is the
+  // same question `site_resolved` answers per message, asked per conversation.
+  if (apiKey) {
+    await setConversationApiKey(env, sessionId, apiKey).catch((e) =>
+      console.error("Conversation api_key write failed:", e)
+    );
+  }
 
   // Where the branding-removal script has got to in this conversation, plus
   // Pop Convert's own review gate.
@@ -334,6 +354,13 @@ export async function handleCrispMessage(env: Env, body: WebhookBody) {
       reviewAsked: askedReviewNow,
     });
   }
+
+  // The topics the answer drew on double as a free label on the conversation —
+  // no extra inference, and it is the tag that would have answered "how many
+  // watermark conversations today" without a LIKE over first messages.
+  await syncKbTags(env, sessionId, result.topics_used ?? []).catch((e) =>
+    console.error("KB tag write failed:", e)
+  );
 
   await finish({
     covered: result.covered,

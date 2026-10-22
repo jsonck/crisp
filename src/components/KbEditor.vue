@@ -352,7 +352,10 @@ onMounted(load);
     <div class="sidebar">
       <h2>
         Topics
-        <router-link to="/" class="nav-link">Conversations</router-link>
+        <span class="nav-links">
+          <router-link to="/pulse" class="nav-link">Pulse</router-link>
+          <router-link to="/" class="nav-link">Conversations</router-link>
+        </span>
       </h2>
 
       <ul>
@@ -683,6 +686,11 @@ onMounted(load);
   display: flex;
   align-items: baseline;
   justify-content: space-between;
+}
+
+.nav-links {
+  display: flex;
+  gap: 10px;
 }
 
 .nav-link {

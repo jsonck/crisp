@@ -2,6 +2,7 @@ import { createRouter, createWebHistory } from "vue-router";
 import ConversationList from "./components/ConversationList.vue";
 import SnapshotView from "./components/SnapshotView.vue";
 import KbEditor from "./components/KbEditor.vue";
+import PulseView from "./components/PulseView.vue";
 import KbLogin from "./components/KbLogin.vue";
 import { getSession } from "./services/kb";
 import { DEV_NO_LOGIN, devSignIn } from "./services/supabase";
@@ -12,6 +13,7 @@ const router = createRouter({
     { path: "/", component: ConversationList },
     { path: "/snapshot/:id", component: SnapshotView },
     { path: "/kb", component: KbEditor, meta: { requiresAuth: true } },
+    { path: "/pulse", component: PulseView, meta: { requiresAuth: true } },
     { path: "/kb/login", component: KbLogin },
   ],
 });

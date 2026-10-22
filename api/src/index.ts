@@ -128,6 +128,48 @@ app.post("/answer", async (c) => {
   return c.json({ ...result, handoff, nobody_online });
 });
 
+// The pulse: what came in, what it was about, and how it is trending. Reads
+// the metric views rather than the raw tables, so the shape of a number is
+// defined once in SQL (0011_conversation_log.sql) and not re-derived here.
+//
+// Editor-gated like /answer. These are customer conversations, and the view
+// definitions deliberately run as the caller — but this endpoint talks to
+// Supabase with the service key, so the gate here IS the access control.
+app.get("/metrics", async (c) => {
+  if (!(await isEditor(c.env, c.req.header("Authorization")))) {
+    return c.json({ error: "Not a knowledge base editor" }, 403);
+  }
+
+  // Default to four weeks: long enough for a weekly shape to be visible,
+  // short enough that the whole response stays small.
+  const days = Math.min(Math.max(Number(c.req.query("days") ?? 28), 1), 365);
+  const since = new Date(Date.now() - days * 86_400_000).toISOString().slice(0, 10);
+
+  const get = async (path: string) => {
+    const response = await fetch(`${c.env.SUPABASE_URL}/rest/v1${path}`, {
+      headers: {
+        apikey: c.env.SUPABASE_SECRET_KEY,
+        Authorization: `Bearer ${c.env.SUPABASE_SECRET_KEY}`,
+      },
+    });
+    if (!response.ok) {
+      console.error("Metrics query failed:", path, response.status);
+      return [];
+    }
+    return (await response.json()) as unknown[];
+  };
+
+  const [daily, tags, responses] = await Promise.all([
+    get(`/conversation_daily?day=gte.${since}&order=day.desc`),
+    get(`/conversation_tag_daily?day=gte.${since}&order=day.desc,conversations.desc`),
+    get(
+      `/conversation_first_response?day=gte.${since}&first_response_seconds=gt.0&select=day,first_response_seconds&order=day.desc`
+    ),
+  ]);
+
+  return c.json({ since, days, daily, tags, first_response: responses });
+});
+
 // Crisp wants a response in under a second, and answering takes several. So
 // verify, acknowledge, and do the work after the response has gone out.
 app.post("/crisp/webhook", async (c) => {

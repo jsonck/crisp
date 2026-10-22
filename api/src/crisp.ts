@@ -128,6 +128,69 @@ export async function getRecentMessages(env: Env, sessionId: string) {
   return json.data ?? [];
 }
 
+// The whole history, oldest first. getRecentMessages returns only the most
+// recent page, which is all the model needs and not enough to mirror a
+// conversation — Crisp pages backwards from `timestamp_before`, 20 at a time.
+export async function fetchAllMessages(env: Env, sessionId: string) {
+  let all: CrispMessage[] = [];
+  let before: number | undefined;
+
+  // A conversation long enough to hit this is pathological, and a runaway loop
+  // against someone else's API is worse than a truncated transcript.
+  for (let page = 0; page < 50; page++) {
+    const query = before ? `?timestamp_before=${before}` : "";
+    const response = await fetch(
+      `https://api.crisp.chat/v1/website/${WEBSITE_ID}/conversation/${sessionId}/messages${query}`,
+      { headers: authHeaders(env) }
+    );
+
+    if (!response.ok) {
+      console.error("Crisp messages fetch failed:", response.status, sessionId);
+      return all.length ? all : null;
+    }
+
+    const json = (await response.json()) as { data?: CrispMessage[] };
+    const batch = json.data ?? [];
+    if (!batch.length) break;
+
+    all = [...batch, ...all];
+    if (batch.length < 20) break;
+    before = batch[0].timestamp;
+  }
+
+  return all;
+}
+
+export interface CrispConversation {
+  session_id: string;
+  created_at?: number;
+  updated_at?: number;
+  state?: string;
+  meta?: {
+    nickname?: string;
+    email?: string;
+    data?: Record<string, unknown>;
+  };
+}
+
+// One page of the conversation list, newest `updated_at` first. The caller
+// decides where to stop — the backfill walks until it runs out, the nightly
+// sync until it passes the window it cares about.
+export async function listConversations(env: Env, page: number) {
+  const response = await fetch(
+    `https://api.crisp.chat/v1/website/${WEBSITE_ID}/conversations/${page}`,
+    { headers: authHeaders(env) }
+  );
+
+  if (!response.ok) {
+    console.error("Crisp conversations fetch failed:", response.status, "page", page);
+    return null;
+  }
+
+  const json = (await response.json()) as { data?: CrispConversation[] };
+  return json.data ?? [];
+}
+
 // `type: "note"` is operator-only: it lands in the conversation for the team
 // but is never delivered to the customer.
 // `mentions` takes operator user_ids and is what actually pushes a notification

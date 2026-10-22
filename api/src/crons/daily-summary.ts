@@ -1,30 +1,33 @@
 import { Env } from "../index";
+import {
+  WEBSITE_ID,
+  fetchAllMessages,
+  listConversations,
+  type CrispConversation,
+  type CrispMessage,
+} from "../crisp";
+import { replaceModelTags, saveDailySummary, syncConversation, type ModelTag } from "../log";
 
-const CRISP_IDENTIFIER = "012fbb8d-c0a4-45df-a7f1-33b976790cd0";
-const WEBSITE_ID = "293e3fde-cb94-4151-b17c-33ddbb80ca09";
-
-interface Message {
-  from: string;
-  type: string;
-  content: string;
-  timestamp: number;
-  user?: { nickname?: string };
-}
-
-interface Conversation {
-  session_id: string;
-  meta?: { nickname?: string; email?: string };
-  updated_at: number;
-  state: string;
-  last_message?: string;
-}
+type Message = CrispMessage;
+type Conversation = CrispConversation & { updated_at: number; state: string };
 
 interface AnalysisResult {
   conversations: ConversationSummary[];
   escalated: ConversationSummary[];
   went_well: ConversationSummary[];
   topics: TopicCategory[];
+  // One row per conversation: which bucket the model put it in. The counts in
+  // `topics` are derived from this rather than asked for, because a model
+  // adding up its own categories is a step that can silently be wrong, and
+  // because a count is useless for tagging — a tag needs a session_id.
+  classified: Classification[];
   total_count: number;
+}
+
+interface Classification {
+  session_id: string;
+  topic: string;
+  subtopic: string;
 }
 
 interface ConversationSummary {
@@ -46,6 +49,9 @@ export async function dailySummary(env: Env) {
 
   if (conversations.length === 0) {
     await sendEmail(env, formatEmptyDay(yesterday.dateStr));
+    // Still recorded. A day with no conversations is a real data point, and a
+    // gap in the table would be indistinguishable from a night the cron failed.
+    await saveDailySummary(env, yesterday.isoDate, 0, { empty: true }, true);
     return;
   }
 
@@ -53,9 +59,34 @@ export async function dailySummary(env: Env) {
   const conversationsWithMessages = await Promise.all(
     conversations.map(async (conv) => ({
       ...conv,
-      messages: await fetchAllMessages(env, conv.session_id),
+      messages: (await fetchAllMessages(env, conv.session_id)) ?? [],
     }))
   );
+
+  // This is the only place that holds a full transcript for every conversation
+  // of a day, so it is where the mirror gets its complete rows: `complete`,
+  // the real started_at, and the operator replies a webhook never sees because
+  // nobody wrote to the bot again afterwards.
+  //
+  // Sequential on purpose. Twenty parallel conversation syncs is a burst of a
+  // hundred-odd PostgREST calls, and nothing here is in a hurry at 10am UTC.
+  let mirrored = 0;
+  for (const conv of conversationsWithMessages) {
+    try {
+      await syncConversation(env, conv.session_id, conv.messages, {
+        websiteId: WEBSITE_ID,
+        apiKey: typeof conv.meta?.data?.api_key === "string" ? conv.meta.data.api_key : null,
+        nickname: conv.meta?.nickname ?? null,
+        email: conv.meta?.email ?? null,
+        state: conv.state ?? null,
+        complete: true,
+      });
+      mirrored++;
+    } catch (e) {
+      console.error("Nightly mirror failed for", conv.session_id, e);
+    }
+  }
+  console.log(`Mirrored ${mirrored}/${conversationsWithMessages.length} conversations`);
 
   // Analyze with Claude
   const analysis = await analyzeWithClaude(env, conversationsWithMessages);
@@ -63,6 +94,52 @@ export async function dailySummary(env: Env) {
   // Format and send
   const html = formatSummaryEmail(yesterday.dateStr, analysis);
   await sendEmail(env, html);
+
+  // Keep the analysis. It used to exist only inside that email, which meant no
+  // two days could ever be compared — the single biggest reason this bot had
+  // no sense of a trend.
+  await saveDailySummary(env, yesterday.isoDate, analysis.total_count, analysis, true);
+  await persistTags(env, conversationsWithMessages.map((c) => c.session_id), analysis);
+}
+
+// The analysis, re-expressed as tags on conversations. Topic and subtopic are
+// separate tags rather than one "Topic / Subtopic" string, so that counting a
+// parent category stays a plain equality and does not become a prefix match.
+async function persistTags(
+  env: Env,
+  sessionIds: string[],
+  analysis: AnalysisResult
+) {
+  const tags: ModelTag[] = [];
+
+  for (const c of analysis.classified ?? []) {
+    if (!c?.session_id) continue;
+    if (c.topic) tags.push({ sessionId: c.session_id, tag: c.topic });
+    if (c.subtopic && c.subtopic !== c.topic) {
+      tags.push({ sessionId: c.session_id, tag: c.subtopic });
+    }
+  }
+
+  // The two judgement calls are worth tagging in their own right: "show me
+  // every escalation this month" is the query this whole table exists for, and
+  // the model's reason travels with it.
+  for (const e of analysis.escalated ?? []) {
+    if (e?.session_id) tags.push({ sessionId: e.session_id, tag: "escalated", note: e.reason });
+  }
+  for (const w of analysis.went_well ?? []) {
+    if (w?.session_id) tags.push({ sessionId: w.session_id, tag: "went-well", note: w.reason });
+  }
+
+  // Scoped to the conversations actually analysed, so a re-run for one day
+  // clears that day's model tags and nothing else. Hallucinated session_ids
+  // are dropped here rather than failing the insert on a foreign key.
+  const known = new Set(sessionIds);
+  const dropped = tags.filter((t) => !known.has(t.sessionId));
+  if (dropped.length) {
+    console.error(`Discarding ${dropped.length} tags for unknown sessions`);
+  }
+
+  await replaceModelTags(env, sessionIds, tags.filter((t) => known.has(t.sessionId)));
 }
 
 function getYesterdayRange() {
@@ -85,79 +162,38 @@ function getYesterdayRange() {
     timeZone: "America/New_York",
   });
 
-  return { startOfDay, endOfDay, dateStr };
-}
+  // Same instant and same timezone as dateStr, so the row the summary is
+  // stored under can never disagree with the date printed in the email.
+  const isoDate = ny.toLocaleDateString("en-CA", {
+    timeZone: "America/New_York",
+  });
 
-async function crispGet(env: Env, path: string) {
-  const headers = {
-    Authorization: "Basic " + btoa(`${CRISP_IDENTIFIER}:${env.CRISP_KEY}`),
-    "X-Crisp-Tier": "plugin",
-  };
-
-  const response = await fetch(
-    `https://api.crisp.chat/v1${path}`,
-    { headers }
-  );
-
-  if (!response.ok) return null;
-  const json = (await response.json()) as { data: any };
-  return json.data;
+  return { startOfDay, endOfDay, dateStr, isoDate };
 }
 
 async function fetchYesterdayConversations(
   env: Env,
   yesterday: { startOfDay: number; endOfDay: number }
 ): Promise<Conversation[]> {
-  const allConversations: Conversation[] = [];
-  let page = 1;
+  const all: Conversation[] = [];
 
-  while (true) {
-    const data = await crispGet(
-      env,
-      `/website/${WEBSITE_ID}/conversations/${page}`
-    );
-    if (!Array.isArray(data) || data.length === 0) break;
+  for (let page = 1; page <= 50; page++) {
+    const data = await listConversations(env, page);
+    if (!data || data.length === 0) break;
 
     for (const conv of data) {
-      const updatedAt = conv.updated_at;
+      const updatedAt = conv.updated_at ?? 0;
       if (updatedAt >= yesterday.startOfDay && updatedAt <= yesterday.endOfDay) {
-        allConversations.push(conv);
+        all.push(conv as Conversation);
       } else if (updatedAt < yesterday.startOfDay) {
-        // Conversations are sorted by updated_at desc, so we can stop
-        return allConversations;
+        // The list is sorted by updated_at desc, so everything after this is
+        // older than the window.
+        return all;
       }
     }
-
-    page++;
-    if (page > 50) break; // safety limit
   }
 
-  return allConversations;
-}
-
-async function fetchAllMessages(
-  env: Env,
-  sessionId: string
-): Promise<Message[]> {
-  let allMessages: Message[] = [];
-  let timestampBefore: number | undefined;
-
-  while (true) {
-    const query = timestampBefore
-      ? `?timestamp_before=${timestampBefore}`
-      : "";
-    const batch = await crispGet(
-      env,
-      `/website/${WEBSITE_ID}/conversation/${sessionId}/messages${query}`
-    );
-    if (!Array.isArray(batch) || batch.length === 0) break;
-
-    allMessages = [...batch, ...allMessages];
-    if (batch.length < 20) break;
-    timestampBefore = batch[0].timestamp;
-  }
-
-  return allMessages;
+  return all;
 }
 
 async function analyzeWithClaude(
@@ -194,14 +230,8 @@ Analyze these conversations and respond with valid JSON only (no markdown fences
   "went_well": [
     { "nickname": "<customer name>", "email": "<email>", "session_id": "<session_id from the transcript>", "reason": "<brief reason why this went well>" }
   ],
-  "topics": [
-    {
-      "name": "<Parent Category>",
-      "count": <number of conversations>,
-      "subtopics": [
-        { "name": "<specific subtopic>", "count": <number> }
-      ]
-    }
+  "classified": [
+    { "session_id": "<session_id from the transcript>", "topic": "<Parent Category>", "subtopic": "<specific subtopic>" }
   ],
   "total_count": ${conversations.length}
 }
@@ -209,7 +239,7 @@ Analyze these conversations and respond with valid JSON only (no markdown fences
 Rules:
 - "escalated": conversations where the customer was frustrated/angry, the issue wasn't resolved, the agent struggled, or the customer threatened to leave/asked for a refund. Be selective — only flag truly problematic ones.
 - "went_well": conversations where the customer expressed gratitude, the issue was resolved quickly, or the agent went above and beyond. Be selective — only flag genuinely positive ones.
-- "topics": group ALL conversations into parent categories, then break each into specific subtopics. Every conversation should be counted in exactly one subtopic.`;
+- "classified": one entry for EVERY conversation, with no conversation left out and none listed twice. Group them into a small set of parent categories, each broken into a specific subtopic. Reuse the same category and subtopic wording across conversations — these become tags, and "Billing" and "billing questions" as two separate tags make a month of data uncountable.`;
 
   const response = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -228,7 +258,7 @@ Rules:
   if (!response.ok) {
     const errText = await response.text();
     console.error("Anthropic error:", errText);
-    return { conversations: [], escalated: [], went_well: [], topics: [], total_count: conversations.length };
+    return { conversations: [], escalated: [], went_well: [], topics: [], classified: [], total_count: conversations.length };
   }
 
   const json = (await response.json()) as { content: { text: string }[]; stop_reason?: string };
@@ -240,11 +270,38 @@ Rules:
   }
 
   try {
-    return JSON.parse(text) as AnalysisResult;
+    const parsed = JSON.parse(text) as AnalysisResult;
+    return { ...parsed, topics: rollUp(parsed.classified ?? []) };
   } catch {
     console.error("Failed to parse Claude response. stop_reason:", stopReason, "text:", text?.substring(0, 500));
-    return { conversations: [], escalated: [], went_well: [], topics: [], total_count: conversations.length };
+    return { conversations: [], escalated: [], went_well: [], topics: [], classified: [], total_count: conversations.length };
   }
+}
+
+// Counts, computed rather than asked for. The email reads exactly as it did
+// when the model supplied these numbers; the difference is that they now add
+// up, and that each one can be clicked through to the conversations behind it
+// via conversation_tags.
+function rollUp(classified: Classification[]): TopicCategory[] {
+  const parents = new Map<string, Map<string, number>>();
+
+  for (const c of classified) {
+    if (!c?.topic) continue;
+    const subs = parents.get(c.topic) ?? new Map<string, number>();
+    const sub = c.subtopic || "Other";
+    subs.set(sub, (subs.get(sub) ?? 0) + 1);
+    parents.set(c.topic, subs);
+  }
+
+  return [...parents.entries()]
+    .map(([name, subs]) => ({
+      name,
+      count: [...subs.values()].reduce((a, b) => a + b, 0),
+      subtopics: [...subs.entries()]
+        .map(([subName, count]) => ({ name: subName, count }))
+        .sort((a, b) => b.count - a.count),
+    }))
+    .sort((a, b) => b.count - a.count);
 }
 
 function formatSummaryEmail(dateStr: string, analysis: AnalysisResult): string {
