@@ -10,6 +10,7 @@ import {
   getTags,
   addTag,
   removeTag,
+  todayKey,
   type DailyVolume,
   type TagTotal,
   type ConversationHit,
@@ -69,7 +70,8 @@ const totalConversations = computed(() =>
 );
 
 const today = computed(() => {
-  const key = new Date().toISOString().slice(0, 10);
+  // New York, like every other day boundary in this system.
+  const key = todayKey();
   return daily.value.find((d) => d.day === key)?.conversations ?? 0;
 });
 

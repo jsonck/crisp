@@ -42,12 +42,21 @@ export interface ConversationHit {
 }
 
 // Days are returned as YYYY-MM-DD and compared as strings throughout: these
-// are calendar days in the database's timezone, and parsing them into local
-// Date objects is how a dashboard ends up a day out.
+// are calendar days in New York, matching the views and the nightly summary.
+// Parsing them into local Date objects is how a dashboard ends up a day out.
+export const REPORTING_TZ = "America/New_York";
+
+// Today where the team is, not in UTC. In UTC the dashboard rolls over at 8pm
+// Eastern, so "conversations today" reads zero for the last four hours of a
+// working evening — which is exactly when someone looks at it.
+export function todayKey() {
+  return new Date().toLocaleDateString("en-CA", { timeZone: REPORTING_TZ });
+}
+
 function sinceDay(days: number) {
   const d = new Date();
   d.setUTCDate(d.getUTCDate() - (days - 1));
-  return d.toISOString().slice(0, 10);
+  return d.toLocaleDateString("en-CA", { timeZone: REPORTING_TZ });
 }
 
 export async function getDailyVolume(days: number): Promise<DailyVolume[]> {

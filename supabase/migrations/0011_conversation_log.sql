@@ -170,13 +170,18 @@ comment on table daily_summaries is
 -- ---------------------------------------------------------------------------
 
 -- Conversations per tag per day. The trend line an email cannot give you.
+--
+-- "Day" means a New York day, because that is what the daily summary has
+-- always meant and two definitions of today is worse than either one. In UTC
+-- the dashboard rolls over at 8pm Eastern, so "conversations today" reads zero
+-- for the last four hours of a working evening.
 -- security_invoker so the view runs as the caller and the tables' RLS still
 -- applies. Without it a view is evaluated as its owner, and Supabase grants
 -- every authenticated role select on public views — which would hand the whole
 -- conversation history to anyone with a login.
 create view conversation_tag_daily with (security_invoker = on) as
   select
-    date_trunc('day', c.started_at)::date as day,
+    (c.started_at at time zone 'America/New_York')::date as day,
     t.tag,
     t.source,
     count(distinct c.session_id) as conversations
@@ -191,7 +196,7 @@ comment on view conversation_tag_daily is
 -- Volume and shape of a day, independent of tags.
 create view conversation_daily with (security_invoker = on) as
   select
-    date_trunc('day', c.started_at)::date as day,
+    (c.started_at at time zone 'America/New_York')::date as day,
     count(*) as conversations,
     count(*) filter (where c.api_key is not null) as identified,
     sum(c.msg_count) as messages,
@@ -211,7 +216,7 @@ create view conversation_daily with (security_invoker = on) as
 create view conversation_first_response with (security_invoker = on) as
   select
     m.session_id,
-    date_trunc('day', min(m.sent_at) filter (where m.from_role = 'user'))::date as day,
+    (min(m.sent_at) filter (where m.from_role = 'user') at time zone 'America/New_York')::date as day,
     min(m.sent_at) filter (where m.from_role = 'user') as first_user_at,
     min(m.sent_at) filter (
       where m.from_role = 'operator' and not m.is_note
