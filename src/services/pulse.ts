@@ -179,13 +179,20 @@ export async function searchConversations(query: string, limit = 50) {
   })) as ConversationHit[];
 }
 
+// Queried from the conversations side, not the tags side, so that ORDER BY and
+// LIMIT apply to the thing being listed. Going through conversation_tags meant
+// the limit cut an UNORDERED set of tag rows — physical order, so the oldest
+// inserted — and the client-side sort then ran on a slice the server had
+// already truncated. With 88 tagged conversations and a limit of 50, the most
+// recent one on screen was two days stale and nothing looked broken.
 export async function getConversationsByTag(tag: string, days: number, limit = 50) {
   await devSignIn;
   const { data, error } = await supabase
-    .from("conversation_tags")
-    .select("session_id, conversations!inner(session_id, nickname, email, started_at, msg_count, first_question)")
-    .eq("tag", tag)
-    .gte("conversations.started_at", `${sinceDay(days)}T00:00:00Z`)
+    .from("conversations")
+    .select("session_id, nickname, email, started_at, msg_count, first_question, conversation_tags!inner(tag)")
+    .eq("conversation_tags.tag", tag)
+    .gte("started_at", `${sinceDay(days)}T00:00:00Z`)
+    .order("started_at", { ascending: false })
     .limit(limit);
 
   if (error) {
@@ -193,16 +200,17 @@ export async function getConversationsByTag(tag: string, days: number, limit = 5
     return [];
   }
 
-  // The join returns one row per (conversation, source); dedupe to conversations.
+  // A conversation carrying the same tag from two sources joins twice; the
+  // embedded rows are dropped here and the conversation kept once.
   const seen = new Map<string, ConversationHit>();
   for (const row of (data ?? []) as any[]) {
-    const c = row.conversations;
-    if (c && !seen.has(c.session_id)) seen.set(c.session_id, c as ConversationHit);
+    const { conversation_tags: _ignored, ...conversation } = row;
+    if (!seen.has(conversation.session_id)) {
+      seen.set(conversation.session_id, conversation as ConversationHit);
+    }
   }
 
-  return [...seen.values()].sort((a, b) =>
-    (b.started_at ?? "").localeCompare(a.started_at ?? "")
-  );
+  return [...seen.values()];
 }
 
 export interface ConversationTag {
