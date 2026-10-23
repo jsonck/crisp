@@ -301,19 +301,73 @@ export interface FunnelStage {
   pending?: boolean;
 }
 
-export async function getFunnel(days: number): Promise<FunnelDay[]> {
+// Unscoped, the funnel answers a question nobody asked: most conversations are
+// bug reports and inbound spam where asking for a review would be wrong, so
+// "11% of all conversations get asked" measures restraint, not a leak. The
+// scope is what makes the number mean something.
+export async function getFunnel(days: number, tag?: string): Promise<FunnelDay[]> {
   await devSignIn;
+
+  if (!tag) {
+    const { data, error } = await supabase
+      .from("review_funnel_daily")
+      .select("*")
+      .gte("day", sinceDay(days))
+      .order("day");
+
+    if (error) {
+      console.error("getFunnel:", error);
+      return [];
+    }
+    return (data ?? []) as FunnelDay[];
+  }
+
+  // Scoped: read the per-conversation flags and roll them up here, rather than
+  // add a second daily view per possible scope.
   const { data, error } = await supabase
-    .from("review_funnel_daily")
-    .select("*")
-    .gte("day", sinceDay(days))
-    .order("day");
+    .from("review_funnel_conversations")
+    .select("session_id, day, eligible, asked, agreed, claimed, declined, has_reviewed, qualification, conversation_tags!inner(tag)")
+    .eq("conversation_tags.tag", tag)
+    .gte("day", sinceDay(days));
 
   if (error) {
-    console.error("getFunnel:", error);
+    console.error("getFunnel (scoped):", error);
     return [];
   }
-  return (data ?? []) as FunnelDay[];
+
+  // A conversation carrying the tag from two sources (kb and model, say)
+  // joins twice and must not be counted twice.
+  const byConversation = new Map<string, any>();
+  for (const row of (data ?? []) as any[]) {
+    byConversation.set(row.session_id, row);
+  }
+
+  const days_: Record<string, FunnelDay> = {};
+  for (const row of byConversation.values()) {
+    const d = (days_[row.day] ??= {
+      day: row.day,
+      conversations: 0,
+      eligible: 0,
+      asked: 0,
+      agreed: 0,
+      claimed: 0,
+      declined: 0,
+      reviewed: 0,
+      qualification_known: 0,
+      reviewed_known: 0,
+    });
+    d.conversations++;
+    if (row.eligible) d.eligible++;
+    if (row.asked) d.asked++;
+    if (row.agreed) d.agreed++;
+    if (row.claimed) d.claimed++;
+    if (row.declined) d.declined++;
+    if (row.has_reviewed) d.reviewed++;
+    if (row.qualification != null) d.qualification_known++;
+    if (row.has_reviewed != null) d.reviewed_known++;
+  }
+
+  return Object.values(days_).sort((a, b) => a.day.localeCompare(b.day));
 }
 
 export function funnelStages(rows: FunnelDay[]): FunnelStage[] {

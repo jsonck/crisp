@@ -32,6 +32,15 @@ const tags = ref<TagTotal[]>([]);
 const medianReply = ref<number | null>(null);
 const funnel = ref<FunnelStage[]>([]);
 
+// The funnel means nothing unscoped — most conversations are ones where asking
+// for a review would be wrong. Default to the branding/watermark script, which
+// is where the ask actually belongs.
+const FUNNEL_SCOPES = [
+  { label: "Branding & watermark", tag: "Branding & watermark" },
+  { label: "All conversations", tag: undefined as string | undefined },
+];
+const funnelScope = ref(FUNNEL_SCOPES[0]);
+
 const query = ref("");
 const searching = ref(false);
 const results = ref<ConversationHit[] | null>(null);
@@ -50,7 +59,7 @@ async function load() {
     getDailyVolume(days.value),
     getTagDays(days.value),
     getMedianFirstResponse(days.value),
-    getFunnel(days.value),
+    getFunnel(days.value, funnelScope.value.tag),
   ]);
   daily.value = volume;
   tags.value = totalsByTag(tagDays);
@@ -65,7 +74,7 @@ onMounted(async () => {
   else loading.value = false;
 });
 
-watch(days, () => {
+watch([days, funnelScope], () => {
   if (allowed.value) load();
 });
 
@@ -275,11 +284,27 @@ function when(iso: string | null) {
       </section>
 
       <section class="panel">
-        <h2>Review funnel</h2>
+        <div class="panel-head">
+          <h2>Review funnel</h2>
+          <div class="scopes">
+            <button
+              v-for="s in FUNNEL_SCOPES"
+              :key="s.label"
+              :class="{ active: funnelScope.label === s.label }"
+              @click="funnelScope = s"
+            >
+              {{ s.label }}
+            </button>
+          </div>
+        </div>
         <p class="muted small">
           Where the review ask is won and lost, over the last {{ days }} days.
-          Each bar is a share of all conversations; the figure on the right is
-          the share of the step above it.
+          Each bar is a share of the first stage; the figure on the right is the
+          share of the step above it.
+          <template v-if="!funnelScope.tag">
+            Unscoped, the first step is not a leak — most conversations are ones
+            where asking for a review would be wrong.
+          </template>
         </p>
         <div v-if="!funnel.length || !funnel[0].value" class="muted">
           Nothing in this window yet.
@@ -545,6 +570,39 @@ h1 {
   font-size: 10px;
   color: #999;
   white-space: nowrap;
+}
+
+.panel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.panel-head h2 {
+  margin-bottom: 0;
+}
+
+.scopes {
+  display: flex;
+  gap: 6px;
+}
+
+.scopes button {
+  border: 1px solid #e0e0e0;
+  background: #fff;
+  border-radius: 6px;
+  padding: 3px 9px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.scopes button.active {
+  background: #3f51b5;
+  border-color: #3f51b5;
+  color: #fff;
 }
 
 .funnel {
