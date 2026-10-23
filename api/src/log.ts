@@ -63,6 +63,11 @@ export interface ConversationMeta {
   nickname?: string | null;
   email?: string | null;
   state?: string | null;
+  // Pop Convert's own facts, carried in the Crisp session payload: whether
+  // this merchant has reviewed, and whether they are eligible to be asked.
+  // Both are as-of this sync, never as-of now — see 0012_review_funnel.sql.
+  hasReviewed?: boolean | null;
+  qualification?: string | null;
   // True only when the caller walked the whole history. A webhook never can,
   // so it passes false and leaves any existing `true` alone (see below).
   complete?: boolean;
@@ -114,6 +119,11 @@ export async function syncConversation(
   if (meta.nickname) conversation.nickname = meta.nickname;
   if (meta.email) conversation.email = meta.email;
   if (meta.state) conversation.state = meta.state;
+  // Written whenever known, false included — unlike the fields above, false is
+  // the meaningful value here ("has not reviewed") and skipping it would make
+  // an un-reviewed merchant indistinguishable from one we never asked about.
+  if (typeof meta.hasReviewed === "boolean") conversation.has_reviewed = meta.hasReviewed;
+  if (meta.qualification) conversation.qualification = meta.qualification;
   if (timestamps.length) {
     conversation.last_at = timestamps[timestamps.length - 1];
     // A webhook sees only the last page, so its "first" message may not be the
@@ -180,15 +190,21 @@ export async function syncConversation(
 // separate call rather than a second full sync, because by the time the store
 // is known the transcript has already been written and re-sending it would be
 // three round trips to change one column.
-export async function setConversationApiKey(
+export async function setConversationIdentity(
   env: Env,
   sessionId: string,
-  apiKey: string
+  identity: { apiKey?: string | null; hasReviewed?: boolean | null; qualification?: string | null }
 ) {
+  const patch: Record<string, unknown> = {};
+  if (identity.apiKey) patch.api_key = identity.apiKey;
+  if (typeof identity.hasReviewed === "boolean") patch.has_reviewed = identity.hasReviewed;
+  if (identity.qualification) patch.qualification = identity.qualification;
+  if (!Object.keys(patch).length) return;
+
   await supabase(env, `/conversations?session_id=eq.${sessionId}`, {
     method: "PATCH",
     prefer: "return=minimal",
-    body: JSON.stringify({ api_key: apiKey }),
+    body: JSON.stringify(patch),
   });
 }
 

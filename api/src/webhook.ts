@@ -10,7 +10,7 @@ import {
   type CrispMessage,
 } from "./crisp";
 import { loadFlow, recordFlow } from "./flow";
-import { syncConversation, syncKbTags, setConversationApiKey } from "./log";
+import { syncConversation, syncKbTags, setConversationIdentity } from "./log";
 import { performHandoff, HANDOFF_QUIET_WINDOW_MS } from "./handoff";
 import { fetchSiteContext } from "./site";
 
@@ -214,11 +214,13 @@ export async function handleCrispMessage(env: Env, body: WebhookBody) {
   // The mirror was written before the store was resolved, so fill it in now.
   // "How many of our conversations can we even attribute to a merchant" is the
   // same question `site_resolved` answers per message, asked per conversation.
-  if (apiKey) {
-    await setConversationApiKey(env, sessionId, apiKey).catch((e) =>
-      console.error("Conversation api_key write failed:", e)
-    );
-  }
+  // The same call already told us whether this merchant has reviewed and
+  // whether they may be asked, which is the denominator for the review funnel.
+  await setConversationIdentity(env, sessionId, {
+    apiKey,
+    hasReviewed: session.hasReviewed,
+    qualification: session.qualification,
+  }).catch((e) => console.error("Conversation identity write failed:", e));
 
   // Where the branding-removal script has got to in this conversation, plus
   // Pop Convert's own review gate.

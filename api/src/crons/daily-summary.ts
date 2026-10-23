@@ -21,6 +21,7 @@ interface AnalysisResult {
   // adding up its own categories is a step that can silently be wrong, and
   // because a count is useless for tagging — a tag needs a session_id.
   classified: Classification[];
+  review: ReviewOutcome[];
   total_count: number;
 }
 
@@ -28,6 +29,14 @@ interface Classification {
   session_id: string;
   topic: string;
   subtopic: string;
+}
+
+interface ReviewOutcome {
+  session_id: string;
+  outcome: "asked" | "agreed" | "declined" | "claimed";
+  // The customer's own words. Stored as the tag's note so every one of these
+  // judgements can be checked without reopening the conversation.
+  quote?: string;
 }
 
 interface ConversationSummary {
@@ -86,6 +95,10 @@ export async function dailySummary(env: Env) {
         nickname: conv.meta?.nickname ?? null,
         email: conv.meta?.email ?? null,
         state: conv.state ?? null,
+        hasReviewed:
+          typeof conv.meta?.data?.has_reviewed === "boolean" ? conv.meta.data.has_reviewed : null,
+        qualification:
+          typeof conv.meta?.data?.qualification === "string" ? conv.meta.data.qualification : null,
         complete: true,
       });
       mirrored++;
@@ -124,6 +137,18 @@ async function persistTags(
     if (c.topic) tags.push({ sessionId: c.session_id, tag: c.topic });
     if (c.subtopic && c.subtopic !== c.topic) {
       tags.push({ sessionId: c.session_id, tag: c.subtopic });
+    }
+  }
+
+  // Every outcome implies it was asked, which is what makes the funnel a
+  // funnel: "agreed" conversations have to be a subset of "asked" ones, or the
+  // conversion rate between the two steps is meaningless.
+  for (const r of analysis.review ?? []) {
+    if (!r?.session_id || !r.outcome) continue;
+    if (!["asked", "agreed", "declined", "claimed"].includes(r.outcome)) continue;
+    tags.push({ sessionId: r.session_id, tag: "review-asked", note: r.quote ?? null });
+    if (r.outcome !== "asked") {
+      tags.push({ sessionId: r.session_id, tag: `review-${r.outcome}`, note: r.quote ?? null });
     }
   }
 
@@ -218,6 +243,23 @@ async function fetchYesterdayConversations(
   return all;
 }
 
+// Models wrap JSON in markdown fences no matter how firmly the prompt says not
+// to, and a fenced response is a correct answer we would otherwise throw away.
+// Strip the fence rather than re-prompt.
+function parseJsonResponse<T>(text: string | undefined): T | null {
+  if (!text) return null;
+  const cleaned = text
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/, "")
+    .trim();
+  try {
+    return JSON.parse(cleaned) as T;
+  } catch {
+    return null;
+  }
+}
+
 async function analyzeWithClaude(
   env: Env,
   conversations: (Conversation & { messages: Message[] })[]
@@ -255,6 +297,9 @@ Analyze these conversations and respond with valid JSON only (no markdown fences
   "classified": [
     { "session_id": "<session_id from the transcript>", "topic": "<Parent Category>", "subtopic": "<specific subtopic>" }
   ],
+  "review": [
+    { "session_id": "<session_id from the transcript>", "outcome": "asked" | "agreed" | "declined" | "claimed", "quote": "<the customer's own words, verbatim and short>" }
+  ],
   "total_count": ${conversations.length}
 }
 
@@ -262,6 +307,12 @@ Rules:
 - Identify every conversation by its session_id only. Names and emails are already known here and copying them back wastes output and invents typos.
 - "escalated": conversations where the customer was frustrated/angry, the issue wasn't resolved, the agent struggled, or the customer threatened to leave/asked for a refund. Be selective — only flag truly problematic ones.
 - "went_well": conversations where the customer expressed gratitude, the issue was resolved quickly, or the agent went above and beyond. Be selective — only flag genuinely positive ones.
+- "review": only conversations where an agent ASKED the customer to leave a review. Use the strongest outcome that is actually supported by what the customer said:
+    "asked"    -> they were asked and did not answer either way
+    "declined" -> they said no, deflected, or put it off
+    "agreed"   -> they said yes, or asked where to leave it
+    "claimed"  -> they said they had already left it ("done", "just left you 5 stars")
+  Report what was SAID, nothing more — "sure, send the link" is agreed, never claimed. Leave a conversation out entirely if no review was asked for; an omission is the answer for most of them. The quote must be the customer's words copied exactly, so a human can check the call.
 - "classified": one entry for EVERY conversation, with no conversation left out and none listed twice. Group them into a small set of parent categories, each broken into a specific subtopic. Reuse the same category and subtopic wording across conversations — these become tags, and "Billing" and "billing questions" as two separate tags make a month of data uncountable.`;
 
   const response = await fetch("https://api.anthropic.com/v1/messages", {
@@ -286,7 +337,7 @@ Rules:
   if (!response.ok) {
     const errText = await response.text();
     console.error("Anthropic error:", errText);
-    return { conversations: [], escalated: [], went_well: [], topics: [], classified: [], total_count: conversations.length };
+    return { conversations: [], escalated: [], went_well: [], topics: [], classified: [], review: [], total_count: conversations.length };
   }
 
   const json = (await response.json()) as { content: { text: string }[]; stop_reason?: string };
@@ -297,8 +348,8 @@ Rules:
     console.error("Claude response truncated (max_tokens). Response length:", text?.length);
   }
 
-  try {
-    const parsed = JSON.parse(text) as AnalysisResult;
+  const parsed = parseJsonResponse<AnalysisResult>(text);
+  if (parsed) {
 
     // The model is given session_ids and returns them; the names come from
     // Crisp, where they are already correct. A session_id it invented resolves
@@ -320,9 +371,9 @@ Rules:
       went_well: name(parsed.went_well),
       topics: rollUp(parsed.classified ?? []),
     };
-  } catch {
+  } else {
     console.error("Failed to parse Claude response. stop_reason:", stopReason, "text:", text?.substring(0, 500));
-    return { conversations: [], escalated: [], went_well: [], topics: [], classified: [], total_count: conversations.length };
+    return { conversations: [], escalated: [], went_well: [], topics: [], classified: [], review: [], total_count: conversations.length };
   }
 }
 

@@ -11,6 +11,9 @@ import {
   addTag,
   removeTag,
   todayKey,
+  getFunnel,
+  funnelStages,
+  type FunnelStage,
   type DailyVolume,
   type TagTotal,
   type ConversationHit,
@@ -27,6 +30,7 @@ const days = ref(28);
 const daily = ref<DailyVolume[]>([]);
 const tags = ref<TagTotal[]>([]);
 const medianReply = ref<number | null>(null);
+const funnel = ref<FunnelStage[]>([]);
 
 const query = ref("");
 const searching = ref(false);
@@ -42,14 +46,16 @@ const RANGES = [7, 28, 90];
 
 async function load() {
   loading.value = true;
-  const [volume, tagDays, median] = await Promise.all([
+  const [volume, tagDays, median, funnelDays] = await Promise.all([
     getDailyVolume(days.value),
     getTagDays(days.value),
     getMedianFirstResponse(days.value),
+    getFunnel(days.value),
   ]);
   daily.value = volume;
   tags.value = totalsByTag(tagDays);
   medianReply.value = median;
+  funnel.value = funnelStages(funnelDays);
   loading.value = false;
 }
 
@@ -119,6 +125,34 @@ function dayLabel(day: string) {
 const labelEvery = computed(() => Math.ceil(daily.value.length / 12));
 
 const maxTag = computed(() => Math.max(1, ...tags.value.map((t) => t.conversations)));
+
+// Every bar is a share of the FIRST stage, so bar length is comparable all the
+// way down. Scaling each bar to the one above it makes a 90% step and a 10%
+// step look identical, which is the one thing a funnel must not do.
+const funnelTop = computed(() => Math.max(1, funnel.value[0]?.value ?? 1));
+
+function funnelWidth(value: number) {
+  return Math.max(0.6, (value / funnelTop.value) * 100);
+}
+
+// Ordered stages, so an ordinal ramp: one hue, stepping darker as the funnel
+// narrows. Not a per-stage palette — the stages are steps of one thing, and
+// giving each its own hue would imply they are different kinds of thing.
+//
+// These exact steps are validated (dataviz validate_palette --ordinal): hue
+// spread 4°, every adjacent lightness gap >= 0.06 so the steps are visible,
+// and the lightest clears 2:1 against the page so the first bar is not a
+// smudge. Re-run the validator before touching any of them.
+const FUNNEL_RAMP = ["#9fa8da", "#8089cf", "#6670c4", "#4f59b5", "#3b44a0", "#272f7a"];
+
+function funnelColor(i: number) {
+  return FUNNEL_RAMP[Math.min(i, FUNNEL_RAMP.length - 1)];
+}
+
+function pct(share: number | null) {
+  if (share == null) return "";
+  return `${Math.round(share * 100)}%`;
+}
 
 // --- drilling in -----------------------------------------------------------
 
@@ -238,6 +272,42 @@ function when(iso: string | null) {
             <span class="tick">{{ i % labelEvery === 0 ? dayLabel(d.day) : "" }}</span>
           </div>
         </div>
+      </section>
+
+      <section class="panel">
+        <h2>Review funnel</h2>
+        <p class="muted small">
+          Where the review ask is won and lost, over the last {{ days }} days.
+          Each bar is a share of all conversations; the figure on the right is
+          the share of the step above it.
+        </p>
+        <div v-if="!funnel.length || !funnel[0].value" class="muted">
+          Nothing in this window yet.
+        </div>
+        <ul v-else class="funnel">
+          <li v-for="(stage, i) in funnel" :key="stage.label" :class="{ pending: stage.pending }">
+            <span class="fn-label" :title="stage.note">
+              {{ stage.label }}
+              <abbr v-if="stage.note" title="">*</abbr>
+            </span>
+            <div class="fn-track">
+              <div
+                v-if="!stage.pending"
+                class="fn-bar"
+                :style="{ width: funnelWidth(stage.value) + '%', background: funnelColor(i) }"
+              ></div>
+              <span v-if="stage.pending" class="fn-pending">not collected yet</span>
+              <span v-else class="fn-value">{{ stage.value }}</span>
+            </div>
+            <span class="fn-step">{{ stage.pending ? "—" : pct(stage.ofPrevious) }}</span>
+          </li>
+        </ul>
+        <p v-if="funnel.length && funnel[0].value" class="muted small footnote">
+          * “Eligible” is Pop Convert’s own gate (qualification “mango”).
+          “Has reviewed” is its flag as of each conversation’s last sync, so it
+          is a floor — a merchant who reviewed after we last read their session
+          still counts as not having reviewed.
+        </p>
       </section>
 
       <section class="panel">
@@ -477,6 +547,74 @@ h1 {
   white-space: nowrap;
 }
 
+.funnel {
+  list-style: none;
+}
+
+.funnel li {
+  display: grid;
+  grid-template-columns: 150px 1fr 48px;
+  align-items: center;
+  gap: 10px;
+  padding: 3px 0;
+}
+
+.fn-label {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fn-label abbr {
+  color: #999;
+  text-decoration: none;
+  cursor: help;
+}
+
+.fn-track {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: #f3f3f6;
+  border-radius: 3px;
+}
+
+.fn-bar {
+  height: 18px;
+  border-radius: 3px;
+  min-width: 2px;
+}
+
+.fn-value {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Named in words, not drawn as an empty bar — an empty bar is a zero. */
+.fn-pending {
+  font-size: 11px;
+  color: #999;
+  font-style: italic;
+  padding-left: 6px;
+}
+
+.funnel li.pending .fn-label {
+  color: #999;
+}
+
+.fn-step {
+  font-size: 12px;
+  color: #777;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.footnote {
+  margin-top: 8px;
+  line-height: 1.5;
+}
+
 .tags {
   list-style: none;
 }
@@ -704,6 +842,10 @@ h1 {
 
   .tags li {
     grid-template-columns: 120px 1fr 32px;
+  }
+
+  .funnel li {
+    grid-template-columns: 110px 1fr 40px;
   }
 
   .sources {

@@ -272,3 +272,83 @@ export async function removeTag(sessionId: string, tag: string) {
   }
   return null;
 }
+
+// --- the review funnel -----------------------------------------------------
+
+export interface FunnelDay {
+  day: string;
+  conversations: number;
+  eligible: number;
+  asked: number;
+  agreed: number;
+  claimed: number;
+  declined: number;
+  reviewed: number;
+  qualification_known: number;
+  reviewed_known: number;
+}
+
+export interface FunnelStage {
+  label: string;
+  value: number;
+  // Share of the stage above, which is the number a funnel exists to show —
+  // an absolute count alone cannot say where people are being lost.
+  ofPrevious: number | null;
+  note?: string;
+  // True when we hold no data for this stage at all. A stage that is pending
+  // and a stage that is genuinely zero both count zero, and showing them the
+  // same way turns "not collected yet" into "nobody qualified".
+  pending?: boolean;
+}
+
+export async function getFunnel(days: number): Promise<FunnelDay[]> {
+  await devSignIn;
+  const { data, error } = await supabase
+    .from("review_funnel_daily")
+    .select("*")
+    .gte("day", sinceDay(days))
+    .order("day");
+
+  if (error) {
+    console.error("getFunnel:", error);
+    return [];
+  }
+  return (data ?? []) as FunnelDay[];
+}
+
+export function funnelStages(rows: FunnelDay[]): FunnelStage[] {
+  const sum = (k: keyof FunnelDay) =>
+    rows.reduce((total, r) => total + Number(r[k] ?? 0), 0);
+
+  const steps: Omit<FunnelStage, "ofPrevious">[] = [
+    { label: "Conversations", value: sum("conversations") },
+    {
+      label: "Eligible to ask",
+      value: sum("eligible"),
+      note: "Pop Convert says they may be asked (qualification “mango”)",
+      pending: sum("qualification_known") === 0,
+    },
+    { label: "Asked for a review", value: sum("asked") },
+    { label: "Said yes", value: sum("agreed") },
+    { label: "Said they left one", value: sum("claimed") },
+    {
+      label: "Has reviewed",
+      value: sum("reviewed"),
+      note: "Pop Convert’s own flag, as of each conversation’s last sync — a floor, not a total",
+      pending: sum("reviewed_known") === 0,
+    },
+  ];
+
+  // A pending stage is skipped as a denominator too: dividing by a stage we
+  // have not collected would print a conversion rate of nothing into infinity.
+  return steps.map((step, i) => {
+    const previous = steps[i - 1];
+    return {
+      ...step,
+      ofPrevious:
+        i === 0 || step.pending || !previous || previous.pending || !previous.value
+          ? null
+          : step.value / previous.value,
+    };
+  });
+}
