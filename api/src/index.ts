@@ -50,22 +50,29 @@ app.get("/", (c) => {
 });
 
 // Render pings this to decide whether the instance is healthy. Deliberately
-// does no I/O: a health check that talks to Supabase turns someone else's
-// outage into our instance being replaced.
-// Both switches are reported so you can tell which way the deployed copy has
-// them set — the first thing to check when the bot has gone quiet. Off means
-// nothing is even logged; muted means it is all logged and none of it sent.
-app.get("/health", (c) =>
-  c.json({
-    ok: true,
-    uptime: process.uptime(),
-    bot_enabled: BOT_ENABLED,
-    bot_muted: BOT_MUTED,
-  })
-);
+// does no I/O on the public path: a health check that talks to Supabase turns
+// someone else's outage into our instance being replaced.
+//
+// The bot switches are the first thing to check when the bot has gone quiet —
+// off means nothing is even logged, muted means it is all logged and none of
+// it sent — so they stay available, but only to an editor. Told to anyone who
+// asks, they amount to telling a prober whether the bot is awake. Render sends
+// no Authorization header, so its check still costs nothing.
+app.get("/health", async (c) => {
+  const base = { ok: true, uptime: process.uptime() };
+  if (!c.req.header("Authorization")) return c.json(base);
+  if (!(await isEditor(c.env, c.req.header("Authorization")))) return c.json(base);
+  return c.json({ ...base, bot_enabled: BOT_ENABLED, bot_muted: BOT_MUTED });
+});
 
-// Manual trigger for testing
+// Runs the nightly summary on demand. Editor-gated, and it must stay that way:
+// this is not a read. It walks Crisp, spends Anthropic tokens and sends mail,
+// so ungated it is a way for a stranger to run up a bill and flood an inbox by
+// holding down a key.
 app.get("/test-summary", async (c) => {
+  if (!(await isEditor(c.env, c.req.header("Authorization")))) {
+    return c.json({ error: "Not a knowledge base editor" }, 403);
+  }
   await dailySummary(c.env);
   return c.json({ message: "Summary sent!" });
 });
