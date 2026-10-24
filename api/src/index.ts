@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { dailySummary } from "./crons/daily-summary";
 import { answerQuestion } from "./answer";
+import { loadPortal } from "./kb";
 import { handleCrispMessage, BOT_ENABLED, BOT_MUTED } from "./webhook";
 import { verifySignature } from "./crisp";
 import { planHandoff } from "./handoff";
@@ -168,6 +169,29 @@ app.get("/metrics", async (c) => {
   ]);
 
   return c.json({ since, days, daily, tags, first_response: responses });
+});
+
+// The help centre's content. Unauthenticated on purpose: this is the same
+// material the bot says out loud to anyone who opens a chat, and the portal
+// that renders it sits inside a Shopify iframe where our own auth would be a
+// second login for no gain. Only enabled Q&As inside enabled topics are ever
+// returned, which is the same filter the bot applies.
+//
+// Cached hard at the edge rather than per-request in memory: the content
+// changes a few times a week, and every merchant who opens the help centre
+// asks for the identical bytes.
+app.get("/kb", async (c) => {
+  const topics = await loadPortal(c.env);
+  if (!topics) return c.json({ error: "Knowledge base unavailable" }, 502);
+
+  c.header("Cache-Control", "public, max-age=60, s-maxage=300, stale-while-revalidate=86400");
+  return c.json({
+    topics,
+    counts: {
+      topics: topics.length,
+      questions: topics.reduce((n, t) => n + t.questions.length, 0),
+    },
+  });
 });
 
 // Crisp wants a response in under a second, and answering takes several. So

@@ -177,3 +177,82 @@ export const OUTPUT_FORMAT = `Respond with valid JSON only, no markdown fences:
 "asked_to_confirm" and "asked_for_review" both default to false. Set each only when your reply really does that thing — they drive the next step of the branding script, and a wrong flag either repeats a question or skips one.
 
 "needs_human" defaults to true if you omit it. Omitting it on a real customer question is harmless; setting it to false on one leaves them with no reply at all.`;
+
+// --- the merchant-facing portal -------------------------------------------
+//
+// Deliberately a separate loader from loadKnowledgeBase. That one feeds the
+// model and its output is cached by Anthropic on an exact prefix match, so
+// adding columns to it would quietly cost money on every request. This one
+// feeds a web page, wants two columns the bot must never see, and can change
+// shape whenever the portal does.
+
+export interface PortalLink {
+  label: string;
+  kind: "app" | "admin" | "external";
+  to: string;
+}
+
+export interface PortalMedia {
+  src: string;
+  alt: string;
+  caption: string | null;
+  width: number;
+  height: number;
+}
+
+interface PortalQaRow {
+  id: string;
+  topic_id: string;
+  question: string;
+  answer: string;
+  position: number;
+  created_at: string;
+  links: PortalLink[];
+  media: PortalMedia[];
+}
+
+export interface PortalTopic {
+  id: string;
+  name: string;
+  applies_when: string | null;
+  questions: Array<Omit<PortalQaRow, "topic_id" | "position" | "created_at">>;
+}
+
+/**
+ * Only what a merchant may read: enabled Q&As inside enabled topics, exactly
+ * the filter the bot applies. The service key bypasses RLS, so this filtering
+ * is the access control - an unfinished answer is one `enabled` away from a
+ * public URL.
+ */
+export async function loadPortal(env: Env): Promise<PortalTopic[] | null> {
+  const [topics, qaPairs] = await Promise.all([
+    supabaseGet(
+      env,
+      "/topics?select=id,name,applies_when,position,created_at&enabled=is.true&order=position,created_at"
+    ) as Promise<Topic[] | null>,
+    supabaseGet(
+      env,
+      "/qa_pairs?select=id,topic_id,question,answer,position,created_at,links,media&enabled=is.true&order=position,created_at"
+    ) as Promise<PortalQaRow[] | null>,
+  ]);
+
+  if (!topics || !qaPairs) return null;
+
+  return topics
+    .map((topic) => ({
+      id: topic.id,
+      name: topic.name,
+      applies_when: topic.applies_when,
+      questions: qaPairs
+        .filter((qa) => qa.topic_id === topic.id)
+        .map(({ id, question, answer, links, media }) => ({
+          id,
+          question,
+          answer,
+          links: links ?? [],
+          media: media ?? [],
+        })),
+    }))
+    // A topic that is on but empty is a heading with nothing under it.
+    .filter((topic) => topic.questions.length > 0);
+}
