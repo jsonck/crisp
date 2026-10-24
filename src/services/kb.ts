@@ -13,6 +13,27 @@ export interface Topic {
   updated_at: string;
 }
 
+/**
+ * Where an answer can send the merchant. `app` is a path inside Pop Convert,
+ * `admin` a path under their own Shopify admin (stored relative, because the
+ * shop handle differs per store), `external` an absolute URL. Rendered as
+ * buttons by the help centre portal; the bot never sees these.
+ */
+export interface QaLink {
+  label: string;
+  kind: "app" | "admin" | "external";
+  to: string;
+}
+
+/** A picture of the thing the answer is describing. See 0013. */
+export interface QaMedia {
+  src: string;
+  alt: string;
+  caption: string | null;
+  width: number;
+  height: number;
+}
+
 export interface QaPair {
   id: string;
   topic_id: string;
@@ -21,6 +42,8 @@ export interface QaPair {
   enabled: boolean;
   position: number;
   tags: string[];
+  links: QaLink[];
+  media: QaMedia[];
   updated_at: string;
 }
 

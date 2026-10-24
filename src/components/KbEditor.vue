@@ -14,6 +14,7 @@ import {
   testQuestion,
   type Topic,
   type QaPair,
+  type QaLink,
   type BotAnswer,
   type ChatTurn,
   type FlowState,
@@ -209,6 +210,33 @@ async function removeQa(qa: QaPair) {
   const label = qa.question.trim() || "this empty Q&A";
   if (!confirm(`Delete ${label}?`)) return;
   await deleteQaPair(qa.id);
+  await load();
+}
+
+// --- portal extras: links and screenshots ---------------------------------
+//
+// Only removal is wired up. Adding a link means knowing the app's routes, and
+// adding a screenshot means uploading to the kb-media bucket - both are jobs
+// for the capture script in ppc (`pnpm shots`), not for typing into a box.
+
+function kindLabel(kind: QaLink["kind"]) {
+  if (kind === "app") return "Pop Convert";
+  if (kind === "admin") return "Shopify admin";
+  return "Link";
+}
+
+async function removeLink(qa: QaPair, index: number) {
+  busy.value[qa.id] = true;
+  await updateQaPair(qa.id, { links: qa.links.filter((_, i) => i !== index) });
+  busy.value[qa.id] = false;
+  await load();
+}
+
+async function removeShot(qa: QaPair, index: number) {
+  if (!confirm("Remove this screenshot from the answer?")) return;
+  busy.value[qa.id] = true;
+  await updateQaPair(qa.id, { media: qa.media.filter((_, i) => i !== index) });
+  busy.value[qa.id] = false;
   await load();
 }
 
@@ -626,6 +654,47 @@ onMounted(load);
             placeholder="How the bot should answer"
           ></textarea>
 
+          <!--
+            Links and screenshots belong to the help centre portal, not to the
+            bot - it answers in chat, where neither would survive. They are
+            shown here because this is where the answer is written, and an
+            answer that points somewhere should be checked against where it
+            actually points.
+          -->
+          <div v-if="qa.links?.length" class="qa-links">
+            <span class="qa-extra-label">Takes them to</span>
+            <span v-for="(link, i) in qa.links" :key="i" class="qa-link">
+              <span class="qa-link-kind" :class="link.kind">{{ kindLabel(link.kind) }}</span>
+              {{ link.label }}
+              <code>{{ link.to }}</code>
+              <button
+                class="qa-chip-remove"
+                title="Remove this link"
+                :disabled="busy[qa.id]"
+                @click="removeLink(qa, i)"
+              >×</button>
+            </span>
+          </div>
+
+          <div v-if="qa.media?.length" class="qa-media">
+            <span class="qa-extra-label">Shows them</span>
+            <figure v-for="(shot, i) in qa.media" :key="i" class="qa-shot">
+              <a :href="shot.src" target="_blank" rel="noreferrer">
+                <img :src="shot.src" :alt="shot.alt" loading="lazy" />
+              </a>
+              <figcaption>
+                {{ shot.caption || shot.alt }}
+                <span class="qa-shot-dims">{{ shot.width }}&times;{{ shot.height }}</span>
+                <button
+                  class="qa-chip-remove"
+                  title="Remove this screenshot"
+                  :disabled="busy[qa.id]"
+                  @click="removeShot(qa, i)"
+                >×</button>
+              </figcaption>
+            </figure>
+          </div>
+
           <div class="qa-actions">
             <button :disabled="!qaDirty(qa) || busy[qa.id]" @click="saveQa(qa)">
               {{ qaDirty(qa) ? "Save" : "Saved" }}
@@ -879,6 +948,106 @@ hr {
 .qa-question {
   font-weight: 600;
   margin-bottom: 8px;
+}
+
+.qa-extra-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #999;
+  margin-right: 4px;
+}
+
+.qa-links {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.qa-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  background: #f4f6f8;
+  border: 1px solid #e3e6e9;
+  border-radius: 999px;
+  padding: 3px 4px 3px 3px;
+}
+
+.qa-link code {
+  font-size: 11px;
+  color: #666;
+}
+
+.qa-link-kind {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  border-radius: 999px;
+  padding: 2px 7px;
+  color: #fff;
+}
+
+/* Where it goes matters more than that it goes somewhere: leaving the app is
+   the difference worth seeing at a glance. */
+.qa-link-kind.app {
+  background: #4a7dff;
+}
+.qa-link-kind.admin {
+  background: #2e7d32;
+}
+.qa-link-kind.external {
+  background: #777;
+}
+
+.qa-media {
+  display: flex;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.qa-shot {
+  margin: 0;
+  width: 190px;
+}
+
+.qa-shot img {
+  width: 100%;
+  border: 1px solid #e3e6e9;
+  border-radius: 4px;
+  display: block;
+  background: #fff;
+}
+
+.qa-shot figcaption {
+  font-size: 11px;
+  color: #777;
+  line-height: 1.35;
+  margin-top: 4px;
+}
+
+.qa-shot-dims {
+  color: #aaa;
+  margin-left: 4px;
+}
+
+.qa-chip-remove {
+  border: 0;
+  background: none;
+  color: #bbb;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 2px;
+}
+
+.qa-chip-remove:hover:not(:disabled) {
+  color: #d32f2f;
 }
 
 .qa-actions {
