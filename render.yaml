@@ -10,6 +10,8 @@ services:
     name: crisp-api
     runtime: node
     plan: starter
+    # us-east-1, same as the Supabase project it reads on every request.
+    region: virginia
     rootDir: api
     buildCommand: npm install
     startCommand: npm start
