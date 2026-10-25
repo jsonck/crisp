@@ -4,7 +4,7 @@ import { cors } from "hono/cors";
 import { dailySummary } from "./crons/daily-summary";
 import { answerQuestion } from "./answer";
 import { loadPortal } from "./kb";
-import { loadDraft } from "./draft";
+import { draftReply } from "./draft";
 import { handleCrispMessage, BOT_ENABLED, BOT_MUTED } from "./webhook";
 import { verifySignature } from "./crisp";
 import { planHandoff } from "./handoff";
@@ -223,32 +223,32 @@ app.get("/kb", async (c) => {
   });
 });
 
-// What the bot already drafted for one conversation, for the Crisp side panel.
+// Draft a reply for the conversation an agent has open, from the live thread.
 //
-// Read-only and model-free: it serves a row the muted bot wrote when the
-// message came in, or says that none exists. The agent is already reading this
-// conversation in Crisp, so this shows them nothing they cannot already see —
-// but it is customer data, so unlike /kb it is not public.
-app.get("/draft", async (c) => {
+// POST rather than GET: this spends Anthropic tokens and is not idempotent, so
+// it must not be something a browser or a crawler can retry for free.
+//
+// Runs muted — see draft.ts. Nothing is sent to the customer, nothing is
+// persisted, and account-changing tools are refused rather than executed. That
+// is what makes it safe to put behind a button an agent can hold down.
+app.post("/draft", async (c) => {
   if (!isExtension(c.env, c.req.header("X-Ext-Secret"))) {
     return c.json({ error: "Not authorised" }, 403);
   }
 
-  const sessionId = (c.req.query("session_id") ?? "").trim();
+  const body = await c.req.json().catch(() => null);
+  const sessionId = typeof body?.session_id === "string" ? body.session_id.trim() : "";
   // Crisp session ids are `session_` plus a uuid. Validated rather than
-  // trusted: it is interpolated into a PostgREST filter, where an unchecked
-  // value is filter injection and not merely a failed lookup.
+  // trusted: it is interpolated into Crisp and PostgREST paths downstream.
   if (!/^session_[0-9a-f-]{8,64}$/i.test(sessionId)) {
     return c.json({ error: "A valid session_id is required" }, 400);
   }
 
-  const result = await loadDraft(c.env, sessionId);
-  if (!result) return c.json({ error: "Draft lookup failed" }, 502);
+  const result = await draftReply(c.env, sessionId);
+  if (!result.ok) return c.json({ error: result.error }, result.status);
 
-  // No caching: the panel re-reads on every conversation switch, and a draft
-  // appears a second or two after the customer's message lands.
   c.header("Cache-Control", "no-store");
-  return c.json(result);
+  return c.json(result.draft);
 });
 
 // Crisp wants a response in under a second, and answering takes several. So

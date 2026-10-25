@@ -1,112 +1,122 @@
 import { Env } from "./index";
+import { answerQuestion, type Answer } from "./answer";
+import {
+  getRecentMessages,
+  getSessionContext,
+  type CrispMessage,
+} from "./crisp";
+import { fetchSiteContext } from "./site";
+import { loadFlow } from "./flow";
 
-// Reading back what the bot already drafted.
+// Drafting a reply for the conversation an agent is looking at, right now.
 //
-// The bot runs muted (webhook.ts BOT_MUTED), so every inbound visitor message
-// already has an answer computed and stored in `bot_suggestions` — and nobody
-// ever sees it. This is the read side of that table, shaped for the Crisp
-// side-panel extension so an agent picking up a conversation sees the draft
-// instead of the extension inventing its own with a worse prompt.
+// This runs the same pipeline the Crisp webhook runs — same knowledge base,
+// same merchant context resolved from the Crisp session, same branding-script
+// flow state, same tools — against the thread as it stands at this moment.
+// It deliberately reads nothing from `bot_suggestions`: a stored row answers
+// the message it was written for, and the agent is usually several messages
+// past that. Mid-conversation there is no stored row at all, because the bot
+// goes quiet for fifteen minutes after any operator reply, which is precisely
+// when an agent wants a draft.
 //
-// Nothing here calls the model. A draft is served only if it already exists;
-// the cost of this endpoint is one indexed Supabase query.
+// Two things this does NOT do, both load-bearing:
+//
+//   * It never sends. Nothing reaches the customer and no note is posted.
+//   * It runs MUTED, so account-changing tools are refused and reported in
+//     `withheld_actions` instead of executed. An agent asking "what would you
+//     say here" must not thereby remove a merchant's branding. Lookups still
+//     run, because an answer about their plan is useless without them.
+//
+// Nothing is persisted either: no bot_suggestions row, no flow transition, no
+// conversation tag. A draft nobody sent moved the conversation nowhere, and
+// recording it would make the real webhook skip a step the customer never saw.
 
-export interface DraftRow {
+const HISTORY_LIMIT = 10;
+
+export interface LiveDraft extends Answer {
+  // The visitor message this answers, so the panel can show what it replied to
+  // rather than leaving the agent to guess.
   question: string;
-  covered: boolean | null;
-  answer: string | null;
-  reason: string | null;
-  topics_used: string[];
-  tools_used: string[];
-  actions_taken: string[];
-  withheld_actions: string[];
-  would_send_reason: string | null;
-  needs_human: boolean | null;
-  muted: boolean;
-  reply_sent: boolean;
-  posted_note: boolean;
-  skipped: string | null;
-  created_at: string;
+  // Whether a store was resolved from the Crisp session. False means the answer
+  // is the generic one — worth saying, because the agent can see the account in
+  // their own sidebar and would otherwise assume the bot could too.
+  site_resolved: boolean;
+  generated_at: string;
 }
 
-export interface DraftResponse {
-  session_id: string;
-  // The most recent row that actually produced an answer. Null when the bot
-  // has never drafted anything for this conversation.
-  draft: DraftRow | null;
-  // The most recent row of any kind. When this is newer than `draft`, the
-  // draft is for an earlier message and the panel must say so rather than
-  // present a stale answer as the reply to the message on screen.
-  latest: DraftRow | null;
-  stale: boolean;
-}
+export type DraftOutcome =
+  | { ok: true; draft: LiveDraft }
+  | { ok: false; status: 502 | 404 | 409; error: string };
 
-const COLUMNS = [
-  "question",
-  "covered",
-  "answer",
-  "reason",
-  "topics_used",
-  "tools_used",
-  "actions_taken",
-  "withheld_actions",
-  "would_send_reason",
-  "needs_human",
-  "muted",
-  "reply_sent",
-  "posted_note",
-  "skipped",
-  "created_at",
-].join(",");
-
-async function query(env: Env, filter: string): Promise<DraftRow[] | null> {
-  const response = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/bot_suggestions?select=${COLUMNS}&${filter}`,
-    {
-      headers: {
-        apikey: env.SUPABASE_SECRET_KEY,
-        Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
-      },
-    }
-  );
-
-  if (!response.ok) {
-    console.error("bot_suggestions read failed:", response.status, await response.text());
-    return null;
-  }
-  return (await response.json()) as DraftRow[];
+function textOf(content: unknown) {
+  if (typeof content === "string") return content;
+  if (content && typeof (content as any).text === "string") return (content as any).text;
+  return "";
 }
 
 /**
- * The latest draft for one Crisp session, plus the latest row of any kind.
+ * Draft a reply for `sessionId` from the live conversation.
  *
- * Two queries rather than one fetch-and-filter: a long watermark conversation
- * can run to dozens of rows, nearly all of them skipped, and pulling the lot
- * to find one answer gets slower exactly as the conversation gets longer.
+ * The question is the most recent visitor message: that is what the bot would
+ * be answering if it spoke now. Operator messages after it stay in the history,
+ * so a draft written after an agent has already replied knows what was said.
  */
-export async function loadDraft(
-  env: Env,
-  sessionId: string
-): Promise<DraftResponse | null> {
-  const session = `session_id=eq.${encodeURIComponent(sessionId)}`;
+export async function draftReply(env: Env, sessionId: string): Promise<DraftOutcome> {
+  const messages = await getRecentMessages(env, sessionId);
+  if (messages === null) {
+    return { ok: false, status: 502, error: "Could not load this conversation from Crisp." };
+  }
 
-  const [answered, latest] = await Promise.all([
-    // `answer` is null on a row that ran but was not covered, so the filter is
-    // on `skipped` — "the bot actually looked at this message" — and the
-    // not-covered case is kept, because its `reason` is the useful half.
-    query(env, `${session}&skipped=is.null&completed_at=not.is.null&order=created_at.desc&limit=1`),
-    query(env, `${session}&order=created_at.desc&limit=1`),
-  ]);
+  const texts = messages.filter((m: CrispMessage) => m.type === "text");
 
-  if (answered === null || latest === null) return null;
+  // Walk back to the last thing the customer actually said. Everything before
+  // it is history; there is nothing to answer if they have not spoken.
+  const lastVisitor = [...texts].reverse().find((m: CrispMessage) => m.from === "user");
+  const question = textOf(lastVisitor?.content).trim();
+  if (!question) {
+    return {
+      ok: false,
+      status: 409,
+      error: "No customer message to answer in this conversation yet.",
+    };
+  }
 
-  const draft = answered[0] ?? null;
-  const newest = latest[0] ?? null;
+  const history = texts
+    .slice(-HISTORY_LIMIT)
+    .map((m: CrispMessage) => ({
+      role: (m.from === "user" ? "user" : "assistant") as "user" | "assistant",
+      content: textOf(m.content),
+    }))
+    .filter((m) => m.content);
+
+  // answerQuestion appends the question itself. Drop it from the tail of the
+  // history only when it IS the tail — mid-conversation the customer's last
+  // message is often followed by an operator reply, which must stay.
+  if (history.length && history[history.length - 1].content === question) history.pop();
+
+  const session = await getSessionContext(env, sessionId);
+  const siteContext = await fetchSiteContext(env, session.apiKey);
+  const flow = await loadFlow(env, sessionId, session.qualification);
+  if (session.storeUrl && !flow.storeUrl) flow.storeUrl = session.storeUrl;
+
+  const answer = await answerQuestion(
+    env,
+    question,
+    history,
+    siteContext,
+    session.apiKey,
+    flow,
+    // Muted. The one argument that makes this safe to call from a button.
+    true
+  );
 
   return {
-    session_id: sessionId,
-    draft,
-    latest: newest,
-    stale: Boolean(draft && newest && newest.created_at > draft.created_at),
+    ok: true,
+    draft: {
+      ...answer,
+      question,
+      site_resolved: Boolean(siteContext),
+      generated_at: new Date().toISOString(),
+    },
   };
 }
