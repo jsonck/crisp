@@ -1,8 +1,10 @@
+import { timingSafeEqual } from "node:crypto";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { dailySummary } from "./crons/daily-summary";
 import { answerQuestion } from "./answer";
 import { loadPortal } from "./kb";
+import { loadDraft } from "./draft";
 import { handleCrispMessage, BOT_ENABLED, BOT_MUTED } from "./webhook";
 import { verifySignature } from "./crisp";
 import { planHandoff } from "./handoff";
@@ -18,6 +20,7 @@ export interface Env {
   SUPABASE_SECRET_KEY: string;
   CRISP_WEBHOOK_SECRET: string;
   PC_BASE_URL: string;
+  EXT_SECRET: string;
 }
 
 const app = new Hono<{ Bindings: Env }>();
@@ -43,6 +46,25 @@ async function isEditor(env: Env, authHeader: string | undefined) {
 
   if (!response.ok) return false;
   return (await response.json()) === true;
+}
+
+// The Crisp side-panel extension reads drafts with a shared secret rather than
+// an editor JWT. Deliberate: the extension is an internal tool the support team
+// loads unpacked, it has no login screen and no redirect URL a Supabase magic
+// link could come back to, and it already ships a far stronger credential (the
+// Pop Convert admin password) the same way. The secret buys one thing — /draft
+// is not readable by anyone who finds the URL.
+//
+// Scoped to reads of material the agent is already looking at in Crisp.
+// Anything that spends money or changes an account stays on isEditor.
+function isExtension(env: Env, secret: string | undefined) {
+  const expected = env.EXT_SECRET;
+  if (!expected || !secret) return false;
+  // Constant-time, and length-checked first: timingSafeEqual throws on a
+  // length mismatch, which would leak the length back as a 500.
+  const given = Buffer.from(secret);
+  const want = Buffer.from(expected);
+  return given.length === want.length && timingSafeEqual(given, want);
 }
 
 app.get("/", (c) => {
@@ -199,6 +221,34 @@ app.get("/kb", async (c) => {
       questions: topics.reduce((n, t) => n + t.questions.length, 0),
     },
   });
+});
+
+// What the bot already drafted for one conversation, for the Crisp side panel.
+//
+// Read-only and model-free: it serves a row the muted bot wrote when the
+// message came in, or says that none exists. The agent is already reading this
+// conversation in Crisp, so this shows them nothing they cannot already see —
+// but it is customer data, so unlike /kb it is not public.
+app.get("/draft", async (c) => {
+  if (!isExtension(c.env, c.req.header("X-Ext-Secret"))) {
+    return c.json({ error: "Not authorised" }, 403);
+  }
+
+  const sessionId = (c.req.query("session_id") ?? "").trim();
+  // Crisp session ids are `session_` plus a uuid. Validated rather than
+  // trusted: it is interpolated into a PostgREST filter, where an unchecked
+  // value is filter injection and not merely a failed lookup.
+  if (!/^session_[0-9a-f-]{8,64}$/i.test(sessionId)) {
+    return c.json({ error: "A valid session_id is required" }, 400);
+  }
+
+  const result = await loadDraft(c.env, sessionId);
+  if (!result) return c.json({ error: "Draft lookup failed" }, 502);
+
+  // No caching: the panel re-reads on every conversation switch, and a draft
+  // appears a second or two after the customer's message lands.
+  c.header("Cache-Control", "no-store");
+  return c.json(result);
 });
 
 // Crisp wants a response in under a second, and answering takes several. So

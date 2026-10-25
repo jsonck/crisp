@@ -34,3 +34,5 @@ services:
         sync: false
       - key: MAILGUN_KEY
         sync: false
+      - key: EXT_SECRET
+        sync: false

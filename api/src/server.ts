@@ -32,6 +32,11 @@ const env: Env = {
   // Only the daily summary needs this, so a missing value should not stop the
   // webhook from being served.
   MAILGUN_KEY: process.env.MAILGUN_KEY ?? "",
+  // Only the Crisp side-panel extension needs this. Unset means /draft refuses
+  // every caller, which is the right failure: answering the customer matters
+  // more than serving a draft to an agent, so a missing value must not keep
+  // the process from booting.
+  EXT_SECRET: process.env.EXT_SECRET ?? "",
 };
 
 // Stands in for the Workers ExecutionContext. The webhook route acknowledges
