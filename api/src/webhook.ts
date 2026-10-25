@@ -27,6 +27,16 @@ const HISTORY_LIMIT = 10;
 // somebody is doing manual work.
 const MESSAGE_GAP_MS = 1200;
 
+// What the bot is, said once per conversation, immediately before the first
+// thing it ever says. Owned by code rather than by the prompt, because the same
+// answer is read in two places: sent to a customer, where the disclosure is
+// required, and shown to a support agent in the Crisp side panel, who sends it
+// themselves — and a human pasting "I'm Pop Convert's AI assistant" is worse
+// than no disclosure at all. handoff.ts already discloses on its own send path
+// for the same reason; this makes the answer path consistent with it.
+const DISCLOSURE =
+  "Hi! I'm Pop Convert's AI assistant — a human can take over any time if you'd prefer.";
+
 // When nobody is on shift, a suggested note has nobody to suggest it to: it
 // sits there until someone logs in, which the transcripts show can be hours
 // (one watermark request at 10:28 was answered at 16:07). An answer the bot is
@@ -285,6 +295,14 @@ export async function handleCrispMessage(env: Env, body: WebhookBody) {
       })
     );
   } else if (result.covered && result.messages.length && sendReason) {
+    // Disclose before speaking for the first time. Deliberately not folded into
+    // `sent`: that flag means the answer itself reached the customer, and it
+    // drives whether the branding script advances a step.
+    if (!(await alreadySpoken(env, sessionId))) {
+      await sendMessage(env, sessionId, DISCLOSURE);
+      await new Promise((r) => setTimeout(r, MESSAGE_GAP_MS));
+    }
+
     for (const [i, message] of result.messages.entries()) {
       if (i > 0) await new Promise((r) => setTimeout(r, MESSAGE_GAP_MS));
       const ok = await sendMessage(env, sessionId, message);
@@ -386,6 +404,20 @@ export async function handleCrispMessage(env: Env, body: WebhookBody) {
     handoff_sent: handoff.sent,
     was_assigned: handoff.wasAssigned,
   });
+}
+
+// Has the bot ever spoken in this conversation? Either an answer it sent or a
+// handoff announcement — handoff.ts introduces itself too, so a conversation
+// that has already had one does not need the disclosure again.
+//
+// Unbounded in time, unlike alreadyHandedOff: saying what you are is a
+// once-per-conversation courtesy, not something to repeat after a quiet spell.
+async function alreadySpoken(env: Env, sessionId: string) {
+  const rows = await supabase(
+    env,
+    `/bot_suggestions?session_id=eq.${sessionId}&or=(reply_sent.is.true,handoff_sent.is.true)&select=id&limit=1`
+  );
+  return Array.isArray(rows) && rows.length > 0;
 }
 
 // Did we already promise this conversation a human recently? Checks our own
